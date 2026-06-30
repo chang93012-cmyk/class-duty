@@ -1,0 +1,2846 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>🌟 우리 반 1인 1역 체크</title>
+<!--
+  변경 요약 (이번 패치):
+  1. 📆 CalendarView: 신청 시각 → 승인 시각 + 📝 메모 노출 (fmtHM 헬퍼 추가)
+  2. 🔑 PinChangeModal 신설 + Header 우측 🔑 PIN 변경 버튼 (학생/임원/교사 공통)
+  3. 🪑 Desk 타일 텍스트 break-keep + line-clamp-2, grid minmax 64px
+  4. 🎯 SeatLayoutManager DnD 전면 개편: 좌(학생)·우(역할) 사이드바 + HTML5 DnD + 탭(모바일) 폴백
+  5. 📝 SelfCheckTab·ApproveCheckTab·CalendarView에 활동 메모(0~200자) 흐름 추가
+     - roleRequests[date][sid].note / checks[date][sid].noteSnapshot 필드 (호환 유지, version:4)
+
+  이전 리팩토링(학생 단일 로그인 + 임원 권한 자동 부여) 흐름은 그대로 유지.
+-->
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone@7.23.0/babel.min.js"></script>
+<script>
+  Babel.registerPreset("react-classic", {
+    presets: [[Babel.availablePresets["react"], { runtime: "classic" }]]
+  });
+</script>
+<script src="https://unpkg.com/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore-compat.js"></script>
+<style>
+  body{font-family:'Pretendard','Apple SD Gothic Neo','Malgun Gothic',sans-serif;background:#fffaf3;}
+  .hide-print{}
+  @media print{ .hide-print{display:none!important;} body{background:#fff;} }
+  .scrollbar-soft::-webkit-scrollbar{height:8px;width:8px}
+  .scrollbar-soft::-webkit-scrollbar-thumb{background:#e5e7eb;border-radius:4px}
+  .coupon-ticket{
+    position:relative;background:#ffffff;border:2px dashed #9ca3af;border-radius:18px;
+    padding:18px 16px 14px;box-shadow:0 2px 6px rgba(0,0,0,0.06);overflow:hidden;
+  }
+  .coupon-ticket::before,
+  .coupon-ticket::after{
+    content:'';position:absolute;width:22px;height:22px;background:#fffaf3;
+    border:2px dashed #9ca3af;border-radius:50%;top:50%;transform:translateY(-50%);
+  }
+  .coupon-ticket::before{ left:-13px; }
+  .coupon-ticket::after { right:-13px; }
+  .coupon-ticket.used{ opacity:0.55; filter:grayscale(0.6); }
+  .coupon-ticket.pending{ border-color:#f59e0b; background:#fffbeb; }
+  .barcode{ display:flex; justify-content:center; gap:1px; height:28px; margin-bottom:6px; }
+  .barcode span{ display:inline-block; background:#111827; height:100%; }
+  /* 🪑 타일 텍스트 줄바꿈 (line-clamp 폴백) */
+  .line-clamp-2{
+    display:-webkit-box;
+    -webkit-line-clamp:2;
+    -webkit-box-orient:vertical;
+    overflow:hidden;
+  }
+  .break-keep{ word-break:keep-all; overflow-wrap:anywhere; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react-classic">
+const { useState, useEffect, useMemo, useRef } = React;
+/* ============================================================
+   🔥 Firebase 초기화
+============================================================ */
+const firebaseConfig = {
+  apiKey: "AIzaSyAM8RUDy0UeYD3h1ujBuiOTGDta609DtAY",
+  authDomain: "class-duty.firebaseapp.com",
+  projectId: "class-duty",
+  storageBucket: "class-duty.firebasestorage.app",
+  messagingSenderId: "962643517972",
+  appId: "1:962643517972:web:babffb0fa9cd34007abd01",
+  measurementId: "G-RVY9E2EMHL"
+};
+firebase.initializeApp(firebaseConfig);
+const db = firebase.firestore();
+db.enablePersistence({ synchronizeTabs: true }).catch(()=>{});
+const DOC_REF = db.collection('classDuty').doc('main');
+/* ============================================================
+   유틸 / 상수
+============================================================ */
+const POS = {
+  president: { ko:'회장',     emoji:'👑', cls:'bg-yellow-200 text-yellow-900 border-yellow-400' },
+  maleVP:    { ko:'남부회장', emoji:'💙', cls:'bg-sky-200    text-sky-900    border-sky-400'    },
+  femaleVP:  { ko:'여부회장', emoji:'🌸', cls:'bg-pink-200   text-pink-900   border-pink-400'   },
+};
+const DEFAULT_STUDENT_PW = '0000';
+const todayStr = (d=new Date()) => {
+  const y=d.getFullYear(), m=String(d.getMonth()+1).padStart(2,'0'), dd=String(d.getDate()).padStart(2,'0');
+  return `${y}-${m}-${dd}`;
+};
+const nowHM = () => {
+  const d=new Date(), h=d.getHours(), m=String(d.getMinutes()).padStart(2,'0');
+  const am = h<12?'오전':'오후'; const h12 = ((h+11)%12)+1;
+  return `${am} ${h12}:${m}`;
+};
+const fmtHM = (ts) => {
+  if(!ts) return '';
+  const d = new Date(ts);
+  const h = d.getHours(), m = String(d.getMinutes()).padStart(2,'0');
+  const am = h<12?'오전':'오후'; const h12 = ((h+11)%12)+1;
+  return `${am} ${h12}:${m}`;
+};
+const uid = () => Math.random().toString(36).slice(2,9);
+
+const currentRoleNames = (student, roles) =>
+  (student.roleIds||[])
+    .map(rid => roles.find(r=>r.id===rid)?.name)
+    .filter(Boolean)
+    .join(', ');
+function resolveRoleDisplay(student, checkInfo, isToday, roles){
+  if(!isToday && checkInfo){
+    const snap = checkInfo.roleSnapshot;
+    if(snap !== undefined && snap !== null){
+      if(Array.isArray(snap)) return snap.join(', ') || '역할 없음';
+      const s = String(snap).trim();
+      return s || '역할 없음';
+    }
+  }
+  return currentRoleNames(student, roles) || '역할 없음';
+}
+const actorLabel = (a)=>{
+  if(!a) return '';
+  if(a.position==='teacher') return '👨‍🏫 선생님';
+  if(a.position==='student') return `🧒 ${a.name}`;
+  const p = POS[a.position];
+  return p ? `${p.emoji} ${p.ko} ${a.name}` : a.name;
+};
+/* ============================================================
+   초기 더미 데이터
+============================================================ */
+function buildSeed(){
+  const sIds = Array.from({length:6}, ()=>uid());
+  const rIds = Array.from({length:6}, ()=>uid());
+  const students = [
+    { id:sIds[0], name:'김민수', number:1, gender:'M', roleIds:[rIds[0]], position:'maleVP',   points:30, password:DEFAULT_STUDENT_PW },
+    { id:sIds[1], name:'박지훈', number:2, gender:'M', roleIds:[rIds[1]], position:null,       points:10, password:DEFAULT_STUDENT_PW },
+    { id:sIds[2], name:'이준호', number:3, gender:'M', roleIds:[rIds[2]], position:null,       points:0,  password:DEFAULT_STUDENT_PW },
+    { id:sIds[3], name:'이영희', number:4, gender:'F', roleIds:[rIds[3]], position:'femaleVP', points:50, password:DEFAULT_STUDENT_PW },
+    { id:sIds[4], name:'최서연', number:5, gender:'F', roleIds:[rIds[4]], position:null,       points:20, password:DEFAULT_STUDENT_PW },
+    { id:sIds[5], name:'정수아', number:6, gender:'F', roleIds:[rIds[5]], position:'president', points:80, password:DEFAULT_STUDENT_PW },
+  ];
+  const roles = [
+    { id:rIds[0], name:'칠판 정리' },
+    { id:rIds[1], name:'우유 당번' },
+    { id:rIds[2], name:'분리수거' },
+    { id:rIds[3], name:'사물함 정리 도우미' },
+    { id:rIds[4], name:'화분 물주기' },
+    { id:rIds[5], name:'책장 정리' },
+  ];
+  const officers = students.filter(s=>s.position).map(s=>({position:s.position, name:s.name}));
+  const checks = {};
+  const history = [];
+  for(let i=6;i>=0;i--){
+    const d = new Date(); d.setDate(d.getDate()-i);
+    const key = todayStr(d);
+    checks[key] = {};
+    students.forEach(s=>{
+      if(Math.random()<0.82){
+        const o = officers[Math.floor(Math.random()*officers.length)];
+        const hh = 13+Math.floor(Math.random()*4);
+        const mm = String(Math.floor(Math.random()*60)).padStart(2,'0');
+        const am = hh<12?'오전':'오후'; const h12 = ((hh+11)%12)+1;
+        const t = `${am} ${h12}:${mm}`;
+        const roleSnap = currentRoleNames(s, roles);
+        checks[key][s.id] = {
+          checked:true,
+          checkedBy:o,
+          checkedAt:t,
+          roleSnapshot: roleSnap
+        };
+        history.push({
+          id:uid(), type:'check', date:key, time:t,
+          actor:o, targetStudent:s.name,
+          desc:`✅ ${POS[o.position].ko} ${o.name}이(가) ${s.name} 학생 체크`,
+          ts: new Date(d.getFullYear(),d.getMonth(),d.getDate(),hh,parseInt(mm)).getTime()
+        });
+      }
+    });
+  }
+  history.sort((a,b)=>b.ts-a.ts);
+
+  const layout = {
+    cols: 8,
+    rows: 8,
+    tiles: {
+      "3,0": { type:'blackboard' },
+      "4,0": { type:'blackboard' },
+      "1,0": { type:'teacherDesk' },
+      "1,2": { type:'desk', studentId:sIds[0], roleId:rIds[0] },
+      "3,2": { type:'desk', studentId:sIds[1], roleId:rIds[1] },
+      "5,2": { type:'desk', studentId:sIds[2], roleId:rIds[2] },
+      "1,4": { type:'desk', studentId:sIds[3], roleId:rIds[3] },
+      "3,4": { type:'desk', studentId:sIds[4], roleId:rIds[4] },
+      "5,4": { type:'desk', studentId:sIds[5], roleId:rIds[5] },
+    }
+  };
+
+  const coupons = [
+    { id:uid(), name:'숙제 1회 면제권', price:30, emoji:'📚' },
+    { id:uid(), name:'자리 이동권',     price:50, emoji:'🪑' },
+    { id:uid(), name:'간식 받기',       price:20, emoji:'🍪' },
+    { id:uid(), name:'음악 신청권',     price:15, emoji:'🎵' },
+  ];
+
+  return {
+    students, roles, checks, history, layout, coupons,
+    ownedCoupons: [],
+    roleRequests: {},
+    passwords:{ teacher:'teacher1234', officer:'1234' },
+    version:4
+  };
+}
+/* ============================================================
+   🔥 Firestore 실시간 동기화 훅
+============================================================ */
+const LS_KEY = 'classDuty_v1';
+function useStore(){
+  const [data, setData] = useState(null);
+  const [syncStatus, setSyncStatus] = useState('connecting');
+  const skipNextWrite = useRef(true);
+  useEffect(()=>{
+    const unsub = DOC_REF.onSnapshot(
+      { includeMetadataChanges:true },
+      (snap)=>{
+        if(snap.exists){
+          skipNextWrite.current = true;
+          const raw = snap.data();
+          if(!raw.layout){ raw.layout = { cols:8, rows:8, tiles:{} }; }
+          if(!raw.coupons) raw.coupons = [];
+          if(!raw.ownedCoupons) raw.ownedCoupons = [];
+          if(!raw.roleRequests) raw.roleRequests = {};
+          if(!raw.passwords) raw.passwords = { teacher:'teacher1234', officer:'1234' };
+          if(typeof raw.passwords.officer !== 'string') raw.passwords.officer = '1234';
+          if(raw.students){
+            raw.students.forEach(s=>{
+              if(typeof s.points !== 'number') s.points = 0;
+              if(typeof s.password !== 'string') s.password = DEFAULT_STUDENT_PW;
+            });
+          }
+          setData(raw);
+          setSyncStatus(snap.metadata.fromCache ? 'offline' : 'synced');
+        }else{
+          let seed;
+          try{
+            const raw = localStorage.getItem(LS_KEY);
+            if(raw){ seed = JSON.parse(raw); }
+          }catch(e){}
+          if(!seed) seed = buildSeed();
+          if(!seed.layout) seed.layout = { cols:8, rows:8, tiles:{} };
+          if(!seed.coupons) seed.coupons = [];
+          if(!seed.ownedCoupons) seed.ownedCoupons = [];
+          if(!seed.roleRequests) seed.roleRequests = {};
+          DOC_REF.set(seed).catch(e=>console.error('초기화 실패', e));
+        }
+      },
+      (err)=>{
+        console.error('Firestore 구독 오류', err);
+        setSyncStatus('error');
+      }
+    );
+    return ()=>unsub();
+  },[]);
+  const writeTimer = useRef(null);
+  useEffect(()=>{
+    if(data===null) return;
+    if(skipNextWrite.current){ skipNextWrite.current=false; return; }
+    if(writeTimer.current) clearTimeout(writeTimer.current);
+    writeTimer.current = setTimeout(()=>{
+      DOC_REF.set(data).catch(e=>{
+        console.error('저장 실패', e);
+        setSyncStatus('error');
+      });
+    }, 400);
+    return ()=>{ if(writeTimer.current) clearTimeout(writeTimer.current); };
+  },[data]);
+  return [data, setData, syncStatus];
+}
+/* ============================================================
+   공통 컴포넌트
+============================================================ */
+function Badge({position, name, big=false}){
+  const p = POS[position];
+  if(!p) return null;
+  return (
+    <span className={`inline-flex items-center gap-1 px-2 py-1 rounded-full border ${p.cls} ${big?'text-base font-bold':'text-xs font-semibold'}`}>
+      <span>{p.emoji}</span><span>{p.ko}</span>{name && <span>{name}</span>}
+    </span>
+  );
+}
+function Modal({open,onClose,title,children,wide=false}){
+  if(!open) return null;
+  return (
+    <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4 hide-print" onClick={onClose}>
+      <div className={`bg-white rounded-2xl shadow-xl w-full ${wide?'max-w-3xl':'max-w-md'} p-5 max-h-[90vh] overflow-auto`} onClick={e=>e.stopPropagation()}>
+        <div className="flex justify-between items-center mb-3">
+          <h3 className="text-lg font-bold">{title}</h3>
+          <button className="text-2xl text-gray-400 hover:text-gray-700" onClick={onClose}>×</button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+/* ============================================================
+   🔑 PinChangeModal (학생/교사 공용)
+============================================================ */
+function PinChangeModal({open, onClose, mode, me, data, setData}){
+  const [cur,setCur] = useState('');
+  const [np,setNp] = useState('');
+  const [np2,setNp2] = useState('');
+  const [err,setErr] = useState('');
+  useEffect(()=>{
+    if(open){ setCur(''); setNp(''); setNp2(''); setErr(''); }
+  },[open]);
+  if(!open) return null;
+  const submit = ()=>{
+    const c = cur.trim(), n = np.trim(), n2 = np2.trim();
+    const currentPw = mode==='teacher'
+      ? (data.passwords?.teacher || '')
+      : ((me && me.password) || DEFAULT_STUDENT_PW);
+    if(!c){ setErr('현재 PIN을 입력하세요'); return; }
+    if(c !== currentPw){ setErr('현재 PIN이 일치하지 않아요'); return; }
+    if(!n){ setErr('새 PIN을 입력하세요 (공백 불가)'); return; }
+    if(n !== n2){ setErr('새 PIN 확인이 일치하지 않아요'); return; }
+    if(n === currentPw){ setErr('기존 PIN과 동일해요. 새 PIN을 사용하세요.'); return; }
+    setData(prev=>{
+      const nd = structuredClone(prev);
+      if(mode==='teacher'){
+        nd.passwords.teacher = n;
+        nd.history.unshift({
+          id:uid(), type:'pwChange', date:todayStr(), time:nowHM(),
+          actor:{position:'teacher', name:'선생님'},
+          desc:`🔑 👨‍🏫 선생님이 비밀번호 변경`,
+          ts:Date.now()
+        });
+      } else {
+        if(!me) return prev;
+        const s = nd.students.find(x=>x.id===me.id);
+        if(!s) return prev;
+        s.password = n;
+        const actor = me.position
+          ? {position:me.position, name:me.name}
+          : {position:'student', name:me.name};
+        nd.history.unshift({
+          id:uid(), type:'pwChange', date:todayStr(), time:nowHM(),
+          actor, desc:`🔑 ${me.name}이(가) 본인 PIN 변경`,
+          ts:Date.now()
+        });
+      }
+      return nd;
+    });
+    alert('변경되었습니다');
+    onClose();
+  };
+  return (
+    <Modal open={open} onClose={onClose} title="🔑 PIN(비밀번호) 변경">
+      <div className="space-y-3">
+        <div className="text-xs text-gray-500">
+          {mode==='teacher'
+            ? '👨‍🏫 선생님 비밀번호를 변경합니다.'
+            : `🧒 ${me?.name || ''} 본인의 PIN을 변경합니다.`}
+        </div>
+        <label className="block">
+          <div className="text-xs text-gray-600 mb-1">현재 PIN</div>
+          <input type="password" inputMode="numeric" maxLength={8}
+            value={cur} onChange={e=>setCur(e.target.value)}
+            className="w-full border-2 rounded-lg p-2 focus:border-emerald-500 outline-none"
+            autoFocus/>
+        </label>
+        <label className="block">
+          <div className="text-xs text-gray-600 mb-1">새 PIN</div>
+          <input type="password" inputMode="numeric" maxLength={8}
+            value={np} onChange={e=>setNp(e.target.value)}
+            className="w-full border-2 rounded-lg p-2 focus:border-emerald-500 outline-none"/>
+        </label>
+        <label className="block">
+          <div className="text-xs text-gray-600 mb-1">새 PIN 확인</div>
+          <input type="password" inputMode="numeric" maxLength={8}
+            value={np2} onChange={e=>setNp2(e.target.value)}
+            onKeyDown={e=>{ if(e.key==='Enter') submit(); }}
+            className="w-full border-2 rounded-lg p-2 focus:border-emerald-500 outline-none"/>
+        </label>
+        {err && <div className="text-red-500 text-sm">{err}</div>}
+        <div className="flex gap-2">
+          <button className="flex-1 p-2 bg-gray-200 rounded-lg" onClick={onClose}>취소</button>
+          <button className="flex-1 p-2 bg-emerald-600 text-white rounded-lg font-bold" onClick={submit}>변경</button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+/* ============================================================
+   상단 헤더 (🔑 PIN 변경 버튼 추가)
+============================================================ */
+function Header({mode, authedStudent, onLogout, onOpenPinChange, syncStatus}){
+  const theme = mode==='teacher' ? 'bg-violet-600' : 'bg-emerald-500';
+  const label = mode==='teacher' ? '👨‍🏫 선생님 모드' : '🧒 학생 모드';
+  const syncMap = {
+    connecting: { ico:'⏳', txt:'연결 중', cls:'bg-yellow-400/30' },
+    synced:     { ico:'☁', txt:'실시간 동기화', cls:'bg-emerald-400/30' },
+    offline:    { ico:'📴', txt:'오프라인', cls:'bg-orange-400/30' },
+    error:      { ico:'⚠', txt:'동기화 오류', cls:'bg-red-400/30' },
+  };
+  const sync = syncMap[syncStatus] || syncMap.connecting;
+  return (
+    <header className={`${theme} text-white shadow-md hide-print`}>
+      <div className="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between gap-3 flex-wrap">
+        <div className="flex items-center gap-3 flex-wrap">
+          <div className="text-2xl font-extrabold">🌟 우리 반 1인 1역</div>
+          <span className="px-3 py-1 rounded-full bg-white/20 text-sm font-semibold">{label}</span>
+          {mode==='student' && authedStudent && (
+            <span className="px-2 py-1 rounded-full bg-white/20 text-sm font-semibold">
+              {authedStudent.gender==='M'?'👦':'👧'} {authedStudent.name} · 💰 {authedStudent.points||0}P
+            </span>
+          )}
+          {mode==='student' && authedStudent && authedStudent.position && (
+            <Badge position={authedStudent.position} name={authedStudent.name} big />
+          )}
+        </div>
+        <div className="flex items-center gap-2 flex-wrap">
+          <span title={sync.txt} className={`px-2 py-1 rounded-full text-xs font-semibold ${sync.cls}`}>
+            {sync.ico} <span className="hidden sm:inline">{sync.txt}</span>
+          </span>
+          <button onClick={onOpenPinChange}
+            className="px-3 py-1.5 bg-white/90 text-gray-800 hover:bg-white rounded-lg text-sm font-bold"
+            title="현재 로그인한 사용자의 PIN을 변경합니다">
+            🔑 <span className="hidden sm:inline">PIN 변경</span>
+          </button>
+          <button onClick={onLogout} className="px-3 py-1.5 bg-white text-gray-800 hover:bg-gray-100 rounded-lg text-sm font-bold">🔁 모드 전환</button>
+        </div>
+      </div>
+    </header>
+  );
+}
+/* ============================================================
+   🔐 AppGateway — 학생 / 교사 2-way
+============================================================ */
+function AppGateway({data, onLogin}){
+  const [step,setStep] = useState('choose');
+  const [pw,setPw] = useState('');
+  const [err,setErr] = useState('');
+  const [sid,setSid] = useState('');
+  useEffect(()=>{ setPw(''); setErr(''); },[step]);
+  const sortedStudents = [...data.students].sort((a,b)=>a.number-b.number);
+  const reset = ()=>{ setStep('choose'); setPw(''); setErr(''); setSid(''); };
+  return (
+    <div className="min-h-screen flex items-center justify-center p-4 bg-gradient-to-br from-amber-50 via-orange-50 to-yellow-50">
+      <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-6">
+        <div className="text-center mb-5">
+          <div className="text-5xl mb-2">🌟</div>
+          <h1 className="text-2xl font-extrabold">우리 반 1인 1역</h1>
+          <p className="text-sm text-gray-500 mt-1">🔐 로그인 후 이용할 수 있어요</p>
+        </div>
+        {step==='choose' && (
+          <div className="grid grid-cols-1 gap-3">
+            <button onClick={()=>setStep('spw')}
+              className="p-4 rounded-xl bg-emerald-100 hover:bg-emerald-200 border-2 border-emerald-300 text-left">
+              <div className="text-2xl">🧒 학생 로그인</div>
+              <div className="text-sm text-gray-600">본인 이름과 비밀번호로 로그인 (임원도 동일)</div>
+            </button>
+            <button onClick={()=>setStep('tpw')}
+              className="p-4 rounded-xl bg-violet-100 hover:bg-violet-200 border-2 border-violet-300 text-left">
+              <div className="text-2xl">👨‍🏫 선생님 로그인</div>
+              <div className="text-sm text-gray-600">전체를 관리할 수 있어요</div>
+            </button>
+          </div>
+        )}
+        {step==='spw' && (
+          <div className="space-y-3">
+            <div className="font-semibold">🧒 학생 로그인</div>
+            <div>
+              <div className="text-xs text-gray-500 mb-1">👤 이름 선택</div>
+              <select className="w-full border-2 rounded-lg p-3" value={sid} onChange={e=>setSid(e.target.value)}>
+                <option value="">-- 선택 --</option>
+                {sortedStudents.map(s=>(
+                  <option key={s.id} value={s.id}>
+                    {s.number}. {s.name} {s.gender==='M'?'👦':'👧'}{s.position?` · ${POS[s.position].emoji}${POS[s.position].ko}`:''}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <div className="text-xs text-gray-500 mb-1">🔑 비밀번호</div>
+              <input type="password" className="w-full border-2 rounded-lg p-3"
+                value={pw} onChange={e=>setPw(e.target.value)}
+                placeholder={`기본: ${DEFAULT_STUDENT_PW}`}
+                onKeyDown={e=>{ if(e.key==='Enter') document.getElementById('sLoginBtn').click(); }}/>
+            </div>
+            {err && <div className="text-red-500 text-sm">{err}</div>}
+            <div className="flex gap-2">
+              <button className="flex-1 p-2.5 bg-gray-200 rounded-lg" onClick={reset}>← 뒤로</button>
+              <button id="sLoginBtn" className="flex-1 p-2.5 bg-emerald-600 text-white rounded-lg font-bold"
+                onClick={()=>{
+                  if(!sid){ setErr('이름을 선택하세요'); return; }
+                  const s = data.students.find(x=>x.id===sid);
+                  if(!s){ setErr('학생을 찾을 수 없어요'); return; }
+                  if((s.password||DEFAULT_STUDENT_PW)!==pw){ setErr('비밀번호가 틀렸어요'); return; }
+                  onLogin({mode:'student', authedStudent:s});
+                }}>🔓 로그인</button>
+            </div>
+            <div className="text-xs text-gray-400 text-center">
+              비밀번호를 잊었으면 선생님께 초기화 요청하세요
+            </div>
+          </div>
+        )}
+        {step==='tpw' && (
+          <div className="space-y-3">
+            <div className="font-semibold">👨‍🏫 선생님 비밀번호</div>
+            <input type="password" value={pw} onChange={e=>setPw(e.target.value)}
+              className="w-full border-2 rounded-lg p-3 text-lg focus:border-blue-500 outline-none"
+              placeholder="비밀번호를 입력하세요" autoFocus
+              onKeyDown={e=>{ if(e.key==='Enter') document.getElementById('pwOk').click(); }} />
+            {err && <div className="text-red-500 text-sm">{err}</div>}
+            <div className="flex gap-2">
+              <button className="flex-1 p-2.5 bg-gray-200 rounded-lg" onClick={reset}>← 뒤로</button>
+              <button id="pwOk" className="flex-1 p-2.5 bg-blue-600 text-white rounded-lg font-bold"
+                onClick={()=>{
+                  if(pw===data.passwords.teacher){ onLogin({mode:'teacher'}); }
+                  else setErr('비밀번호가 틀렸어요');
+                }}>확인</button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+/* ============================================================
+   체크 리스트 — 교사만 체크 가능
+============================================================ */
+function CheckList({data, setData, mode, date, onCheckLogged}){
+  const isToday = date === todayStr();
+  const canCheck = mode==='teacher';
+  const dayChecks = data.checks[date] || {};
+  const toggle = (sid)=>{
+    if(!canCheck) return;
+    if(mode!=='teacher') return;
+    const cur = dayChecks[sid];
+    setData(prev=>{
+      const nd = structuredClone(prev);
+      if(!nd.checks[date]) nd.checks[date] = {};
+      const teacherActor = {position:'teacher', name:'선생님'};
+      if(cur && cur.checked){
+        delete nd.checks[date][sid];
+        if(nd.roleRequests && nd.roleRequests[date] && nd.roleRequests[date][sid]){
+          const r = nd.roleRequests[date][sid];
+          if(r.status==='approved'){
+            delete nd.roleRequests[date][sid];
+          }
+        }
+        nd.history.unshift({
+          id:uid(), type:'uncheck', date, time:nowHM(),
+          actor: teacherActor,
+          desc: `↩ 👨‍🏫 선생님이 ${nd.students.find(s=>s.id===sid)?.name} 체크 해제 (${date})`,
+          ts: Date.now()
+        });
+      } else {
+        const student = nd.students.find(s=>s.id===sid);
+        const roleSnap = student ? currentRoleNames(student, nd.roles) : '';
+        nd.checks[date][sid] = {
+          checked:true,
+          checkedBy:teacherActor,
+          checkedAt:nowHM(),
+          roleSnapshot: roleSnap,
+          noteSnapshot: '' // 교사 직접 체크는 메모 없음
+        };
+        nd.history.unshift({
+          id:uid(), type:'check', date, time:nowHM(),
+          actor:teacherActor, targetStudent: student?.name,
+          desc: `✅ 👨‍🏫 선생님이 ${student?.name} 체크 (${date})`,
+          ts: Date.now()
+        });
+      }
+      return nd;
+    });
+    onCheckLogged && onCheckLogged();
+  };
+  const sorted = [...data.students].sort((a,b)=>a.number-b.number);
+  return (
+    <div className="bg-white rounded-2xl shadow p-4">
+      <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
+        <h2 className="text-xl font-bold">📅 {date} {isToday && <span className="ml-1 text-sm bg-emerald-100 text-emerald-700 px-2 py-0.5 rounded-full">오늘</span>}</h2>
+        <div className="text-sm text-gray-500">
+          {canCheck ? '✏ 체크/해제 가능' : '👁 조회 전용'}
+          {!isToday && <span className="ml-2 text-xs text-blue-600">📸 당시 역할 표시</span>}
+        </div>
+      </div>
+      <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-2">
+        {sorted.map(s=>{
+          const c = dayChecks[s.id];
+          const isChecked = !!(c && c.checked);
+          const roleNames = resolveRoleDisplay(s, c, isToday, data.roles);
+          return (
+            <div key={s.id}
+              onClick={()=>toggle(s.id)}
+              className={`p-3 rounded-xl border-2 transition ${canCheck?'cursor-pointer hover:shadow':'cursor-default'} ${isChecked?'bg-emerald-50 border-emerald-400':'bg-gray-50 border-gray-200'}`}>
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-1 flex-wrap">
+                    <span className="text-xs text-gray-500">{s.number}번</span>
+                    <span className="font-bold text-lg truncate">{s.name}</span>
+                    <span className="text-xs">{s.gender==='M'?'👦':'👧'}</span>
+                    {s.position && <Badge position={s.position} />}
+                  </div>
+                  <div className="text-sm text-gray-600 truncate" title={roleNames}>📌 {roleNames}</div>
+                  {c && c.checkedBy && (
+                    <div className="text-xs text-gray-500 mt-1">
+                      {actorLabel(c.checkedBy)} 체크 ({c.checkedAt})
+                    </div>
+                  )}
+                </div>
+                <div className={`text-3xl select-none ${isChecked?'':'opacity-30'}`}>{isChecked?'✅':'⬜'}</div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+/* ============================================================
+   🙋 SelfCheckTab — 활동 메모 입력 추가
+============================================================ */
+function SelfCheckTab({data, setData, authedStudent}){
+  const today = todayStr();
+  const me = data.students.find(s=>s.id===authedStudent.id) || authedStudent;
+  const todayCheck = data.checks?.[today]?.[me.id];
+  const todayReq = data.roleRequests?.[today]?.[me.id];
+  const roleNames = currentRoleNames(me, data.roles);
+  const hasRoles = (me.roleIds||[]).length > 0;
+
+  const isApproved = !!(todayCheck && todayCheck.checked);
+  const isPending = todayReq?.status === 'pending';
+  const isRejected = todayReq?.status === 'rejected';
+
+  const [note, setNote] = useState('');
+
+  const apply = ()=>{
+    if(isApproved || isPending) return;
+    const snap = currentRoleNames(me, data.roles);
+    const trimmedNote = (note||'').trim();
+    setData(prev=>{
+      const nd = structuredClone(prev);
+      if(!nd.roleRequests) nd.roleRequests = {};
+      if(!nd.roleRequests[today]) nd.roleRequests[today] = {};
+      nd.roleRequests[today][me.id] = {
+        status:'pending',
+        requestedAt: Date.now(),
+        requestedAtLabel: nowHM(),
+        roleSnapshot: snap,
+        note: trimmedNote
+      };
+      nd.history.unshift({
+        id:uid(), type:'roleRequest', date:today, time:nowHM(),
+        actor:{position:'student', name:me.name},
+        desc:`🙋 ${me.name}이(가) '${snap}' 수행 인증 신청${trimmedNote?` (메모 있음)`:''}`,
+        ts: Date.now()
+      });
+      return nd;
+    });
+    setNote('');
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="bg-white rounded-2xl shadow p-4">
+        <div className="flex items-center justify-between flex-wrap gap-2">
+          <div>
+            <div className="text-xs text-gray-500">오늘 {today}</div>
+            <div className="text-2xl font-extrabold">
+              {me.number}번 {me.name} {me.gender==='M'?'👦':'👧'}
+              {me.position && <span className="ml-2"><Badge position={me.position}/></span>}
+            </div>
+            <div className="text-sm text-gray-700 mt-1">
+              📌 오늘의 담당 역할: <b>{roleNames || '없음'}</b>
+            </div>
+          </div>
+          <div className="text-right">
+            <div className="text-xs text-gray-500">내 포인트</div>
+            <div className="text-2xl font-extrabold text-emerald-600">💰 {me.points||0}P</div>
+          </div>
+        </div>
+      </div>
+
+      {!hasRoles ? (
+        <div className="bg-gray-50 border-2 border-dashed border-gray-300 rounded-2xl p-6 text-center">
+          <div className="text-4xl mb-2">📭</div>
+          <div className="text-lg font-bold text-gray-700">오늘 담당 역할이 없어요</div>
+          <div className="text-sm text-gray-500 mt-1">선생님께 담당 역할 배정을 요청해보세요</div>
+        </div>
+      ) : isApproved ? (
+        <div className="bg-emerald-50 border-2 border-emerald-300 rounded-2xl p-5">
+          <div className="text-3xl mb-1">✅</div>
+          <div className="text-xl font-extrabold text-emerald-800">이미 승인 완료</div>
+          <div className="text-sm text-emerald-700 mt-2">
+            오늘 역할 수행이 인정되었어요. 수고했어요! 🎉
+          </div>
+          {todayCheck.checkedBy && (
+            <div className="text-xs text-gray-600 mt-2">
+              승인/체크: <b>{actorLabel(todayCheck.checkedBy)}</b>
+              {todayCheck.checkedAt && <span className="text-gray-400"> · {todayCheck.checkedAt}</span>}
+            </div>
+          )}
+          {todayCheck.roleSnapshot && (
+            <div className="text-xs text-gray-600 mt-1">📌 인정된 역할: {todayCheck.roleSnapshot}</div>
+          )}
+          {todayCheck.noteSnapshot && (
+            <div className="text-xs text-gray-600 mt-1 italic">📝 내가 적은 활동: "{todayCheck.noteSnapshot}"</div>
+          )}
+          <button disabled className="mt-3 w-full p-3 rounded-lg font-bold text-base bg-gray-200 text-gray-400 cursor-not-allowed">
+            🙋 수행 인증하기 (완료)
+          </button>
+        </div>
+      ) : isPending ? (
+        <div className="bg-yellow-50 border-2 border-yellow-300 rounded-2xl p-5">
+          <div className="text-3xl mb-1">⏳</div>
+          <div className="text-xl font-extrabold text-yellow-800">승인 대기 중</div>
+          <div className="text-sm text-yellow-700 mt-2">
+            학급임원 또는 선생님의 승인을 기다리고 있어요
+          </div>
+          <div className="text-xs text-gray-600 mt-2">
+            🕐 신청 시각: <b>{todayReq.requestedAtLabel}</b>
+          </div>
+          <div className="text-xs text-gray-600 mt-1">
+            📌 신청 시점 역할: {todayReq.roleSnapshot || '없음'}
+          </div>
+          {todayReq.note && (
+            <div className="text-xs text-gray-700 mt-1 italic">📝 내가 적은 활동: "{todayReq.note}"</div>
+          )}
+          <button disabled className="mt-3 w-full p-3 rounded-lg font-bold text-base bg-gray-200 text-gray-400 cursor-not-allowed">
+            🙋 수행 인증하기 (대기 중)
+          </button>
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {isRejected && (
+            <div className="bg-red-50 border-2 border-red-300 rounded-2xl p-4">
+              <div className="font-bold text-red-700">↩ 이전 신청이 반려되었어요</div>
+              <div className="text-sm text-red-600 mt-1">
+                다시 신청할 수 있어요. 역할 수행을 마친 후 [🙋 수행 인증하기]를 눌러주세요.
+              </div>
+              {todayReq.rejectedBy && (
+                <div className="text-xs text-gray-500 mt-1">
+                  반려: <b>{actorLabel(todayReq.rejectedBy)}</b>
+                </div>
+              )}
+              {todayReq.note && (
+                <div className="text-xs text-gray-600 mt-1 italic">📝 내가 적은 활동: "{todayReq.note}"</div>
+              )}
+            </div>
+          )}
+          <div className="bg-white rounded-2xl shadow p-5 text-center">
+            <div className="text-4xl mb-2">🙋</div>
+            <div className="text-lg font-bold mb-2">오늘 역할 수행을 인증하세요</div>
+            <div className="text-sm text-gray-600 mb-3">
+              담당 역할: <b>{roleNames}</b><br/>
+              <span className="text-xs text-gray-500">✏ 적은 내용을 임원이 확인한 뒤 승인합니다. 활동을 구체적으로 적을수록 좋아요.</span>
+            </div>
+
+            <label className="block text-left mb-3">
+              <div className="text-sm font-semibold text-gray-700 mb-1">
+                📝 오늘 어떤 활동을 했나요? <span className="text-xs text-gray-400">(선택 입력, 최대 200자)</span>
+              </div>
+              <textarea
+                value={note}
+                onChange={e=>setNote(e.target.value.slice(0,200))}
+                rows={3}
+                placeholder="예: 칠판을 깨끗하게 닦고 분필가루도 정리했어요"
+                className="w-full border-2 rounded-lg p-2 text-sm focus:border-emerald-500 outline-none resize-none"/>
+              <div className="text-right text-xs text-gray-400">{note.length}/200</div>
+            </label>
+
+            <button onClick={apply}
+              className="w-full p-3 rounded-lg font-bold text-lg bg-emerald-500 hover:bg-emerald-600 text-white">
+              🙋 수행 인증하기
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+/* ============================================================
+   🔔 ApproveCheckTab — 메모 박스 강조 표시
+============================================================ */
+function ApproveCheckTab({data, setData, mode, officer}){
+  const today = todayStr();
+  const isTeacher = mode==='teacher';
+
+  if(!isTeacher && !officer){
+    return (
+      <div className="bg-red-50 border-2 border-red-300 rounded-2xl p-6 text-center">
+        <div className="text-4xl mb-2">🔒</div>
+        <div className="text-lg font-bold text-red-700">권한이 없습니다</div>
+        <div className="text-sm text-red-600 mt-1">학급임원만 사용할 수 있는 기능이에요. 다시 로그인 해주세요.</div>
+      </div>
+    );
+  }
+
+  const reqs = data.roleRequests?.[today] || {};
+  const pending = Object.entries(reqs)
+    .filter(([,v])=>v.status==='pending')
+    .map(([sid,v])=>({sid, ...v}))
+    .sort((a,b)=>(a.requestedAt||0) - (b.requestedAt||0));
+
+  const approver = isTeacher ? {position:'teacher', name:'선생님'} : officer;
+  const approverDisp = actorLabel(approver);
+
+  const approve = (sid, roleSnap)=>{
+    setData(prev=>{
+      const nd = structuredClone(prev);
+      if(!nd.roleRequests || !nd.roleRequests[today] || !nd.roleRequests[today][sid]) return prev;
+      const req = nd.roleRequests[today][sid];
+      if(req.status!=='pending') return prev;
+      req.status = 'approved';
+      req.approvedBy = approver;
+      req.approvedAt = Date.now();
+      if(!nd.checks[today]) nd.checks[today] = {};
+      nd.checks[today][sid] = {
+        checked: true,
+        checkedBy: approver,
+        checkedAt: nowHM(),
+        roleSnapshot: req.roleSnapshot || roleSnap || '',
+        noteSnapshot: req.note || ''
+      };
+      const student = nd.students.find(s=>s.id===sid);
+      nd.history.unshift({
+        id:uid(), type:'roleApprove', date:today, time:nowHM(),
+        actor: approver,
+        desc:`✅ ${approverDisp}이(가) ${student?.name}의 역할 수행 승인${req.note ? ` (메모 있음)` : ''}`,
+        ts: Date.now()
+      });
+      return nd;
+    });
+  };
+  const reject = (sid)=>{
+    setData(prev=>{
+      const nd = structuredClone(prev);
+      if(!nd.roleRequests || !nd.roleRequests[today] || !nd.roleRequests[today][sid]) return prev;
+      const req = nd.roleRequests[today][sid];
+      if(req.status!=='pending') return prev;
+      req.status = 'rejected';
+      req.rejectedBy = approver;
+      req.rejectedAt = Date.now();
+      const student = nd.students.find(s=>s.id===sid);
+      nd.history.unshift({
+        id:uid(), type:'roleReject', date:today, time:nowHM(),
+        actor: approver,
+        desc:`↩ ${approverDisp}이(가) ${student?.name}의 신청 반려${req.note ? ` (메모 있음)` : ''}`,
+        ts: Date.now()
+      });
+      return nd;
+    });
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="bg-white rounded-2xl shadow p-4 flex items-center justify-between flex-wrap gap-2">
+        <div>
+          <h2 className="text-xl font-bold">🔔 역할 수행 승인</h2>
+          <div className="text-xs text-gray-500">오늘 {today} · 대기 {pending.length}건</div>
+        </div>
+        <div className="text-sm text-gray-600">
+          승인자: <b>{approverDisp}</b>
+        </div>
+      </div>
+
+      {pending.length===0 ? (
+        <div className="bg-white rounded-2xl shadow p-8 text-center">
+          <div className="text-4xl mb-2">🎉</div>
+          <div className="text-lg font-bold text-gray-700">승인 대기 중인 요청이 없어요</div>
+          <div className="text-sm text-gray-500 mt-1">학생들이 [🙋 내 역할 인증]에서 신청하면 여기에 표시됩니다.</div>
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {pending.map(p=>{
+            const s = data.students.find(x=>x.id===p.sid);
+            if(!s) return null;
+            return (
+              <div key={p.sid}
+                className="bg-yellow-50 border-2 border-yellow-300 rounded-xl p-3 flex flex-col gap-2">
+                <div className="flex items-center justify-between flex-wrap gap-3">
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-xs text-gray-500">{s.number}번</span>
+                      <span className="font-bold text-lg">{s.name}</span>
+                      <span className="text-sm">{s.gender==='M'?'👦':'👧'}</span>
+                      {s.position && <Badge position={s.position}/>}
+                    </div>
+                    <div className="text-sm text-gray-700 mt-1">📌 {p.roleSnapshot || '역할 없음'}</div>
+                    <div className="text-xs text-gray-500 mt-0.5">⏱ 신청 {p.requestedAtLabel || ''}</div>
+                  </div>
+                  <div className="flex gap-2">
+                    <button onClick={()=>approve(p.sid, p.roleSnapshot)}
+                      className="px-4 py-2 bg-emerald-500 hover:bg-emerald-600 text-white rounded-lg font-bold">
+                      ✅ 승인
+                    </button>
+                    <button onClick={()=>reject(p.sid)}
+                      className="px-4 py-2 bg-red-400 hover:bg-red-500 text-white rounded-lg font-bold">
+                      ↩ 반려
+                    </button>
+                  </div>
+                </div>
+                {p.note ? (
+                  <div className="mt-1 p-2 bg-white border border-amber-300 rounded-lg text-sm">
+                    <div className="text-xs text-amber-700 font-semibold mb-0.5">📝 학생이 적은 활동</div>
+                    <div className="text-gray-800 whitespace-pre-wrap break-keep leading-snug">{p.note}</div>
+                  </div>
+                ) : (
+                  <div className="mt-1 text-xs text-gray-400 italic">📝 작성된 활동 메모가 없어요</div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {isTeacher && (
+        <div className="bg-violet-50 border border-violet-200 text-violet-800 rounded-xl p-3 text-xs">
+          💡 과거 날짜 직접 체크/수정은 <b>[✅ 일일 체크]</b> 탭의 날짜 선택기에서 가능합니다
+        </div>
+      )}
+    </div>
+  );
+}
+/* ============================================================
+   📊 통계 (+ 포인트 지급) — 변경 없음
+============================================================ */
+function StatsView({data, setData, mode}){
+  const isTeacher = mode==='teacher';
+  const initialRange = useMemo(()=>{
+    const t = todayStr();
+    const [y,m] = t.slice(0,7).split('-').map(Number);
+    const first = `${y}-${String(m).padStart(2,'0')}-01`;
+    return { start: first, end: t };
+  },[]);
+  const [range,setRange] = useState(initialRange);
+  const [preset,setPreset] = useState('thisMonth');
+  const [pInput, setPInput] = useState({});
+  const [bulkAmount, setBulkAmount] = useState(10);
+  const [bulkReason, setBulkReason] = useState('출석/역할 100% 달성 보상');
+
+  const applyPreset = (key)=>{
+    const today = new Date();
+    const t = todayStr();
+    let s, e;
+    if(key==='today'){ s=t; e=t; }
+    else if(key==='thisWeek'){
+      const dow = today.getDay();
+      const mon = new Date(today); mon.setDate(today.getDate()-((dow+6)%7));
+      s = todayStr(mon); e = t;
+    }
+    else if(key==='last7'){
+      const d = new Date(today); d.setDate(today.getDate()-6);
+      s = todayStr(d); e = t;
+    }
+    else if(key==='thisMonth'){
+      s = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-01`;
+      e = t;
+    }
+    else if(key==='lastMonth'){
+      const y = today.getMonth()===0?today.getFullYear()-1:today.getFullYear();
+      const m = today.getMonth()===0?12:today.getMonth();
+      const lastDay = new Date(y, m, 0).getDate();
+      s = `${y}-${String(m).padStart(2,'0')}-01`;
+      e = `${y}-${String(m).padStart(2,'0')}-${String(lastDay).padStart(2,'0')}`;
+    }
+    else if(key==='last30'){
+      const d = new Date(today); d.setDate(today.getDate()-29);
+      s = todayStr(d); e = t;
+    }
+    else if(key==='allTime'){
+      const keys = Object.keys(data.checks).sort();
+      s = keys[0] || t; e = t;
+    }
+    setRange({start:s, end:e});
+    setPreset(key);
+  };
+  const updateRange = (k,v)=>{
+    setPreset('custom');
+    setRange(prev=>{
+      const next = {...prev, [k]:v};
+      if(next.start>next.end){
+        if(k==='start') next.end = next.start;
+        else next.start = next.end;
+      }
+      return next;
+    });
+  };
+  const stats = useMemo(()=>{
+    const dates = Object.keys(data.checks).filter(d=> d>=range.start && d<=range.end ).sort();
+    const total = dates.length || 1;
+    const perStudent = data.students.map(s=>{
+      const done = dates.filter(d=> data.checks[d]?.[s.id]?.checked ).length;
+      const rate = Math.round(done/total*100);
+      return { ...s, done, rate, totalDays:dates.length };
+    });
+    const avg = perStudent.length ? Math.round(perStudent.reduce((a,b)=>a+b.rate,0)/perStudent.length) : 0;
+    return { perStudent, avg, totalDays:dates.length };
+  },[data, range]);
+  const perfectStudents = stats.totalDays>0
+    ? stats.perStudent.filter(s=>s.rate===100).sort((a,b)=>a.number-b.number)
+    : [];
+  const colorOf = r => r>=90?'bg-emerald-100 text-emerald-700 border-emerald-300'
+                       : r>=70?'bg-yellow-100 text-yellow-700 border-yellow-300'
+                       : 'bg-red-100 text-red-700 border-red-300';
+  const dotOf = r => r>=90?'🟢':r>=70?'🟡':'🔴';
+  const rangeLabel = range.start===range.end ? range.start : `${range.start} ~ ${range.end}`;
+  const presets = [
+    ['today','오늘'],['thisWeek','이번 주'],['last7','최근 7일'],
+    ['thisMonth','이번 달'],['lastMonth','지난 달'],['last30','최근 30일'],['allTime','전체'],
+  ];
+
+  const grantPoints = (sid, delta, reason)=>{
+    if(!isTeacher) return;
+    const amt = parseInt(delta);
+    if(!amt || isNaN(amt)) { alert('포인트 수량을 입력하세요'); return; }
+    const r = (reason||'').trim();
+    if(!r){ alert('지급 사유를 입력하세요'); return; }
+    setData(prev=>{
+      const nd = structuredClone(prev);
+      const s = nd.students.find(x=>x.id===sid);
+      if(!s) return prev;
+      const before = s.points||0;
+      const after = Math.max(0, before + amt);
+      s.points = after;
+      const sign = amt>=0?'➕':'➖';
+      nd.history.unshift({
+        id:uid(), type:'point', date:todayStr(), time:nowHM(),
+        actor:{position:'teacher',name:'선생님'},
+        desc:`${sign} 👨‍🏫 선생님이 ${s.name}에게 ${amt>=0?'+':''}${amt}P 지급 — 사유: "${r}" (${before}P → ${after}P)`,
+        ts: Date.now()
+      });
+      return nd;
+    });
+    setPInput(prev=>({...prev, [sid]:{amount:'', reason:''}}));
+  };
+
+  const grantBulk = ()=>{
+    if(!isTeacher) return;
+    const amt = parseInt(bulkAmount);
+    if(!amt){ alert('수량을 입력하세요'); return; }
+    if(perfectStudents.length===0){ alert('100% 달성자가 없습니다'); return; }
+    const r = (bulkReason||'').trim() || '100% 달성 보상';
+    if(!confirm(`100% 달성자 ${perfectStudents.length}명에게 각 ${amt}P 지급할까요?\n사유: "${r}"`)) return;
+    setData(prev=>{
+      const nd = structuredClone(prev);
+      perfectStudents.forEach(ps=>{
+        const s = nd.students.find(x=>x.id===ps.id);
+        if(!s) return;
+        const before = s.points||0;
+        const after = Math.max(0, before+amt);
+        s.points = after;
+        nd.history.unshift({
+          id:uid(), type:'point', date:todayStr(), time:nowHM(),
+          actor:{position:'teacher',name:'선생님'},
+          desc:`🏆 일괄지급 — 👨‍🏫 선생님이 ${s.name}에게 +${amt}P (${r}) (${before}P → ${after}P)`,
+          ts: Date.now()
+        });
+      });
+      return nd;
+    });
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="bg-white rounded-2xl shadow p-4">
+        <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
+          <div className="font-bold text-lg">📅 통계 기간 설정</div>
+          <div className="text-xs text-gray-500">현재 범위: <b className="text-blue-700">{rangeLabel}</b> ({stats.totalDays}일 기록)</div>
+        </div>
+        <div className="flex flex-wrap gap-1 mb-3">
+          {presets.map(([k,l])=>(
+            <button key={k} onClick={()=>applyPreset(k)}
+              className={`px-3 py-1.5 text-sm rounded-full border-2 font-semibold transition
+                ${preset===k?'bg-blue-600 text-white border-blue-600':'bg-gray-50 border-gray-200 hover:bg-gray-100'}`}>
+              {l}
+            </button>
+          ))}
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <label className="flex items-center gap-1 text-sm">
+            <span className="text-gray-500">시작</span>
+            <input type="date" value={range.start} onChange={e=>updateRange('start', e.target.value)}
+              className="border-2 rounded-lg p-2 text-sm focus:border-blue-500 outline-none"/>
+          </label>
+          <span className="text-gray-400">~</span>
+          <label className="flex items-center gap-1 text-sm">
+            <span className="text-gray-500">종료</span>
+            <input type="date" value={range.end} onChange={e=>updateRange('end', e.target.value)}
+              className="border-2 rounded-lg p-2 text-sm focus:border-blue-500 outline-none"/>
+          </label>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <div className="bg-white rounded-2xl shadow p-4">
+          <div className="text-sm text-gray-500">📊 학급 평균 수행률</div>
+          <div className="text-4xl font-extrabold mt-1">{stats.avg}<span className="text-xl">%</span></div>
+          <div className="text-xs text-gray-500">{rangeLabel} · 기록 {stats.totalDays}일</div>
+        </div>
+        <div className="bg-white rounded-2xl shadow p-4 sm:col-span-2">
+          <div className="flex items-center justify-between mb-2 flex-wrap gap-1">
+            <div className="text-sm text-gray-500">🏆 100% 달성자 <span className="text-xs">({perfectStudents.length}명)</span></div>
+            {isTeacher && perfectStudents.length>0 && (
+              <div className="flex items-center gap-1 flex-wrap">
+                <input type="number" value={bulkAmount} onChange={e=>setBulkAmount(e.target.value)}
+                  className="w-16 border rounded p-1 text-sm" placeholder="P"/>
+                <input value={bulkReason} onChange={e=>setBulkReason(e.target.value)}
+                  className="border rounded p-1 text-sm w-40" placeholder="사유"/>
+                <button onClick={grantBulk}
+                  className="px-3 py-1 bg-yellow-500 text-white rounded text-sm font-bold">🎁 일괄 지급</button>
+              </div>
+            )}
+          </div>
+          {perfectStudents.length===0 ? (
+            <div className="text-sm text-gray-500 bg-gray-50 rounded-xl p-3 text-center">
+              아직 100% 달성한 친구가 없어요. 💪
+            </div>
+          ) : (
+            <div className="flex gap-2 flex-wrap">
+              {perfectStudents.map(s=>(
+                <div key={s.id} className="px-3 py-2 rounded-xl border-2 bg-yellow-50 border-yellow-400">
+                  <div className="text-base">🏆 <b>{s.name}</b> {s.gender==='M'?'👦':'👧'} <span className="text-yellow-700 text-sm">({s.points||0}P)</span></div>
+                  <div className="text-xs text-gray-600">{s.done}/{s.totalDays}일 · 100%</div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="bg-white rounded-2xl shadow p-4" id="report-area">
+        <div className="flex items-center justify-between mb-2 flex-wrap gap-1">
+          <h3 className="font-bold text-lg">👨‍👩‍👧 학생별 수행률 {isTeacher && <span className="text-sm text-violet-600">· 💰 포인트 지급</span>}</h3>
+          <div className="text-xs text-gray-500">{rangeLabel}</div>
+        </div>
+        <div className="grid sm:grid-cols-2 gap-2">
+          {stats.perStudent.sort((a,b)=>a.number-b.number).map(s=>{
+            const inp = pInput[s.id] || {amount:'', reason:''};
+            return (
+              <div key={s.id} className={`p-3 rounded-xl border-2 ${colorOf(s.rate)}`}>
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="font-bold">{s.number}. {s.name} {s.gender==='M'?'👦':'👧'}</div>
+                    <div className="text-xs">{s.done} / {s.totalDays} 일 · 💰 <b>{s.points||0}P</b></div>
+                  </div>
+                  <div className="text-2xl font-extrabold">{dotOf(s.rate)} {s.rate}%</div>
+                </div>
+                <div className="mt-2 h-2 rounded bg-white/60 overflow-hidden">
+                  <div className="h-full bg-current opacity-60" style={{width:`${s.rate}%`}} />
+                </div>
+                {isTeacher && (
+                  <div className="mt-2 flex flex-wrap gap-1 items-center bg-white/70 rounded p-1.5">
+                    <input type="number" value={inp.amount}
+                      onChange={e=>setPInput(p=>({...p,[s.id]:{...inp, amount:e.target.value}}))}
+                      className="w-14 border rounded p-1 text-xs" placeholder="P"/>
+                    <input value={inp.reason}
+                      onChange={e=>setPInput(p=>({...p,[s.id]:{...inp, reason:e.target.value}}))}
+                      className="flex-1 min-w-[80px] border rounded p-1 text-xs" placeholder="지급 사유"/>
+                    <button className="px-2 py-1 bg-emerald-500 text-white rounded text-xs font-bold"
+                      onClick={()=>grantPoints(s.id, parseInt(inp.amount)||0, inp.reason)}>＋</button>
+                    <button className="px-2 py-1 bg-red-500 text-white rounded text-xs font-bold"
+                      onClick={()=>grantPoints(s.id, -(parseInt(inp.amount)||0), inp.reason)}>−</button>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+/* ============================================================
+   📆 CalendarView — 🙋 신청 시각 → ✅ 승인 시각 + 📝 메모
+============================================================ */
+function CalendarView({data}){
+  const [cur,setCur] = useState(()=>{ const d=new Date(); return {y:d.getFullYear(), m:d.getMonth()}; });
+  const [picked,setPicked] = useState(todayStr());
+  const first = new Date(cur.y, cur.m, 1);
+  const startDay = first.getDay();
+  const daysInMonth = new Date(cur.y, cur.m+1, 0).getDate();
+  const cells = [];
+  for(let i=0;i<startDay;i++) cells.push(null);
+  for(let d=1;d<=daysInMonth;d++) cells.push(d);
+  const dayChecks = data.checks[picked] || {};
+  const dayReqs = data.roleRequests?.[picked] || {};
+  const isPickedToday = picked === todayStr();
+  const checkedStudents = Object.entries(dayChecks).filter(([_,v])=>v.checked)
+    .map(([sid,v])=>{
+      const student = data.students.find(s=>s.id===sid);
+      const req = dayReqs[sid] || null;
+      return { student, info:v, req };
+    })
+    .filter(x=>x.student);
+  const move = (delta)=>{
+    let m=cur.m+delta, y=cur.y;
+    if(m<0){m=11;y--;} if(m>11){m=0;y++;}
+    setCur({y,m});
+  };
+  return (
+    <div className="bg-white rounded-2xl shadow p-4">
+      <div className="flex items-center justify-between mb-3">
+        <button className="px-3 py-1 bg-gray-100 rounded-lg" onClick={()=>move(-1)}>◀</button>
+        <h3 className="font-bold text-lg">📆 {cur.y}년 {cur.m+1}월</h3>
+        <button className="px-3 py-1 bg-gray-100 rounded-lg" onClick={()=>move(1)}>▶</button>
+      </div>
+      <div className="grid grid-cols-7 gap-1 text-center text-xs font-semibold text-gray-500 mb-1">
+        {['일','월','화','수','목','금','토'].map(d=><div key={d}>{d}</div>)}
+      </div>
+      <div className="grid grid-cols-7 gap-1">
+        {cells.map((d,i)=>{
+          if(!d) return <div key={i} />;
+          const key = `${cur.y}-${String(cur.m+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+          const cnt = Object.values(data.checks[key]||{}).filter(v=>v.checked).length;
+          const isPick = picked===key;
+          const isTd = key===todayStr();
+          return (
+            <button key={i} onClick={()=>setPicked(key)}
+              className={`aspect-square rounded-lg border-2 text-sm flex flex-col items-center justify-center
+                ${isPick?'border-blue-500 bg-blue-50':'border-transparent hover:bg-gray-50'}
+                ${isTd?'ring-2 ring-emerald-400':''}`}>
+              <div className="font-bold">{d}</div>
+              {cnt>0 && <div className="text-[10px] text-emerald-700">✅ {cnt}</div>}
+            </button>
+          );
+        })}
+      </div>
+      <div className="mt-4 border-t pt-3">
+        <div className="flex items-center gap-2 mb-2 flex-wrap">
+          <div className="font-semibold">📌 {picked} 수행 현황 ({checkedStudents.length}명)</div>
+          {!isPickedToday && checkedStudents.length>0 && (
+            <span className="text-xs text-blue-600">📸 당시 역할 표시</span>
+          )}
+        </div>
+        {checkedStudents.length===0 ? (
+          <div className="text-sm text-gray-400">기록이 없어요</div>
+        ) : (
+          <ul className="space-y-2 text-sm max-h-80 overflow-auto">
+            {checkedStudents.map((x,i)=>{
+              const roleDisp = resolveRoleDisplay(x.student, x.info, isPickedToday, data.roles);
+              const reqLabel = x.req?.requestedAtLabel || (x.req?.requestedAt ? fmtHM(x.req.requestedAt) : '');
+              const hasRequest = !!reqLabel;
+              const note = x.info.noteSnapshot;
+              return (
+                <li key={i} className="border-b last:border-b-0 pb-2">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span>✅</span>
+                    <b>{x.student.name}</b>
+                    <span className="text-xs text-gray-500">📌 {roleDisp}</span>
+                  </div>
+                  {hasRequest ? (
+                    <div className="text-xs mt-0.5 flex flex-wrap items-center gap-1">
+                      <span className="text-amber-700">🙋 신청 {reqLabel}</span>
+                      <span className="text-gray-400">→</span>
+                      <span className="text-emerald-700">☑ 승인 {x.info.checkedAt}</span>
+                      <span className="text-gray-400">·</span>
+                      <span className="text-gray-600">{actorLabel(x.info.checkedBy)}</span>
+                    </div>
+                  ) : (
+                    <div className="text-xs mt-0.5 text-gray-600">
+                      <span className="text-gray-400">·</span> {actorLabel(x.info.checkedBy)} <span className="text-gray-400">({x.info.checkedAt})</span>
+                    </div>
+                  )}
+                  {note && (
+                    <div className="text-xs mt-0.5 text-gray-600 italic line-clamp-2" title={note}>
+                      📝 메모: "{note}"
+                    </div>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+}
+/* ============================================================
+   🪑 SeatLayoutManager — DnD + 사이드바 전면 개편
+============================================================ */
+function SeatLayoutManager({data, setData, mode}){
+  const isTeacher = mode==='teacher';
+  const layout = data.layout || { cols:8, rows:8, tiles:{} };
+  const cols = layout.cols || 8;
+  const rows = layout.rows || 8;
+  const tiles = layout.tiles || {};
+  const [tool, setTool] = useState('assign');
+  const [dragging, setDragging] = useState(null);   // {kind:'student'|'role', id}
+  const [selected, setSelected] = useState(null);   // 탭 폴백
+  const [hoverKey, setHoverKey] = useState(null);
+
+  const TOOL_LABELS = {
+    assign:       { label:'🎯 배정', desc:'좌·우 패널의 칩을 책상 위로 드래그' },
+    desk:         { label:'🪑 책상',     desc:'빈 칸 클릭 시 책상 배치' },
+    blackboard:   { label:'📋 칠판',     desc:'빈 칸에 칠판 배치' },
+    teacherDesk:  { label:'👨‍🏫 선생님 책상', desc:'빈 칸에 선생님 책상 배치' },
+    erase:        { label:'🧽 지우개',   desc:'타일 제거' },
+  };
+
+  const ensureLayout = (nd)=>{
+    if(!nd.layout) nd.layout = { cols:8, rows:8, tiles:{} };
+    if(!nd.layout.tiles) nd.layout.tiles = {};
+    if(!nd.layout.cols) nd.layout.cols = 8;
+    if(!nd.layout.rows) nd.layout.rows = 8;
+    return nd.layout;
+  };
+  const detachRoleFromStudent = (nd, studentId, roleId)=>{
+    if(!studentId || !roleId) return;
+    const s = nd.students.find(x=>x.id===studentId);
+    if(s) s.roleIds = s.roleIds.filter(r=>r!==roleId);
+  };
+
+  /* ---------- 타일 종류 변경 (desk/blackboard/teacherDesk/erase) ---------- */
+  const placeTile = (key, newTile)=>{
+    setData(prev=>{
+      const nd = structuredClone(prev);
+      const lay = ensureLayout(nd);
+      const old = lay.tiles[key];
+      if(old && old.type==='desk'){
+        detachRoleFromStudent(nd, old.studentId, old.roleId);
+      }
+      if(newTile===null){ delete lay.tiles[key]; }
+      else { lay.tiles[key] = newTile; }
+      nd.history.unshift({
+        id:uid(), type:'layoutEdit', date:todayStr(), time:nowHM(),
+        actor:{position:'teacher',name:'선생님'},
+        desc:`🪑 👨‍🏫 선생님이 자리 배치 ${newTile?'변경':'제거'} (${key})`,
+        ts: Date.now()
+      });
+      return nd;
+    });
+  };
+
+  /* ---------- 학생 드롭 ---------- */
+  const dropStudentOnTile = (sid, tileKey)=>{
+    setData(prev=>{
+      const nd = structuredClone(prev);
+      const lay = ensureLayout(nd);
+      const tile = lay.tiles[tileKey];
+      if(!tile || tile.type!=='desk') return prev;
+      // 다른 책상에 있던 같은 학생 제거 (역할은 두는 게 아니라, 그 학생의 roleIds에서 그 책상의 role도 같이 빼야 자연스러움)
+      Object.keys(lay.tiles).forEach(k=>{
+        if(k===tileKey) return;
+        const t = lay.tiles[k];
+        if(t && t.type==='desk' && t.studentId===sid){
+          if(t.roleId){
+            const s = nd.students.find(x=>x.id===sid);
+            if(s) s.roleIds = s.roleIds.filter(r=>r!==t.roleId);
+          }
+          t.studentId = null;
+        }
+      });
+      // 새 책상에 이전 학생이 있었다면 그 학생의 roleIds에서 책상 role 제거
+      const oldStudentId = tile.studentId;
+      if(oldStudentId && tile.roleId){
+        const oldS = nd.students.find(x=>x.id===oldStudentId);
+        if(oldS) oldS.roleIds = oldS.roleIds.filter(r=>r!==tile.roleId);
+      }
+      tile.studentId = sid;
+      // 책상에 역할이 있다면 새 학생에게 결합
+      if(tile.roleId){
+        nd.students.forEach(s=>{
+          if(s.id !== sid) s.roleIds = s.roleIds.filter(r=>r!==tile.roleId);
+        });
+        const ns = nd.students.find(x=>x.id===sid);
+        if(ns && !ns.roleIds.includes(tile.roleId)) ns.roleIds.push(tile.roleId);
+      }
+      const sname = nd.students.find(x=>x.id===sid)?.name || '?';
+      nd.history.unshift({
+        id:uid(), type:'seatAssign', date:todayStr(), time:nowHM(),
+        actor:{position:'teacher',name:'선생님'},
+        desc:`🎯 👨‍🏫 선생님이 자리 배정: ${sname} → (${tileKey})`,
+        ts: Date.now()
+      });
+      return nd;
+    });
+  };
+
+  /* ---------- 역할 드롭 ---------- */
+  const dropRoleOnTile = (rid, tileKey)=>{
+    setData(prev=>{
+      const nd = structuredClone(prev);
+      const lay = ensureLayout(nd);
+      const tile = lay.tiles[tileKey];
+      if(!tile || tile.type!=='desk') return prev;
+      // 다른 책상의 같은 역할 제거
+      Object.keys(lay.tiles).forEach(k=>{
+        if(k===tileKey) return;
+        const t = lay.tiles[k];
+        if(t && t.type==='desk' && t.roleId===rid) t.roleId = null;
+      });
+      // 모든 학생의 roleIds에서 해당 역할 제거
+      nd.students.forEach(s=>{ s.roleIds = s.roleIds.filter(r=>r!==rid); });
+      // 현재 책상에 다른 역할이 있었다면 그 학생의 roleIds에서 그것도 제거
+      if(tile.roleId && tile.roleId !== rid && tile.studentId){
+        const s = nd.students.find(x=>x.id===tile.studentId);
+        if(s) s.roleIds = s.roleIds.filter(r=>r!==tile.roleId);
+      }
+      tile.roleId = rid;
+      // 학생이 있다면 결합
+      if(tile.studentId){
+        const s = nd.students.find(x=>x.id===tile.studentId);
+        if(s && !s.roleIds.includes(rid)) s.roleIds.push(rid);
+      }
+      const rname = nd.roles.find(r=>r.id===rid)?.name || '?';
+      nd.history.unshift({
+        id:uid(), type:'seatAssign', date:todayStr(), time:nowHM(),
+        actor:{position:'teacher',name:'선생님'},
+        desc:`📌 👨‍🏫 선생님이 역할 배정: ${rname} → (${tileKey})`,
+        ts: Date.now()
+      });
+      return nd;
+    });
+  };
+
+  /* ---------- ❌ 타일 학생/역할 비우기 ---------- */
+  const clearTileStudent = (tileKey)=>{
+    setData(prev=>{
+      const nd = structuredClone(prev);
+      const lay = ensureLayout(nd);
+      const tile = lay.tiles[tileKey];
+      if(!tile || tile.type!=='desk' || !tile.studentId) return prev;
+      tile.studentId = null;
+      nd.history.unshift({
+        id:uid(), type:'seatAssign', date:todayStr(), time:nowHM(),
+        actor:{position:'teacher',name:'선생님'},
+        desc:`❌ 👨‍🏫 선생님이 (${tileKey}) 책상의 학생 비움`,
+        ts: Date.now()
+      });
+      return nd;
+    });
+  };
+  const clearTileRole = (tileKey)=>{
+    setData(prev=>{
+      const nd = structuredClone(prev);
+      const lay = ensureLayout(nd);
+      const tile = lay.tiles[tileKey];
+      if(!tile || tile.type!=='desk' || !tile.roleId) return prev;
+      const rid = tile.roleId;
+      if(tile.studentId){
+        const s = nd.students.find(x=>x.id===tile.studentId);
+        if(s) s.roleIds = s.roleIds.filter(r=>r!==rid);
+      }
+      tile.roleId = null;
+      nd.history.unshift({
+        id:uid(), type:'seatAssign', date:todayStr(), time:nowHM(),
+        actor:{position:'teacher',name:'선생님'},
+        desc:`❌ 👨‍🏫 선생님이 (${tileKey}) 책상의 역할 비움`,
+        ts: Date.now()
+      });
+      return nd;
+    });
+  };
+
+  /* ---------- ❌ 칩 자체에서 비우기 ---------- */
+  const removeStudentEverywhere = (sid)=>{
+    for(const k in tiles){
+      const t = tiles[k];
+      if(t && t.type==='desk' && t.studentId===sid){
+        clearTileStudent(k);
+        return;
+      }
+    }
+  };
+  const removeRoleEverywhere = (rid)=>{
+    setData(prev=>{
+      const nd = structuredClone(prev);
+      const lay = ensureLayout(nd);
+      Object.values(lay.tiles).forEach(t=>{
+        if(t && t.type==='desk' && t.roleId===rid) t.roleId = null;
+      });
+      nd.students.forEach(s=>{ s.roleIds = s.roleIds.filter(r=>r!==rid); });
+      const rname = nd.roles.find(r=>r.id===rid)?.name || '?';
+      nd.history.unshift({
+        id:uid(), type:'seatAssign', date:todayStr(), time:nowHM(),
+        actor:{position:'teacher',name:'선생님'},
+        desc:`❌ 👨‍🏫 선생님이 '${rname}' 역할 배정 모두 해제`,
+        ts: Date.now()
+      });
+      return nd;
+    });
+  };
+
+  /* ---------- 타일 클릭 (도구별) ---------- */
+  const handleTileClick = (x,y)=>{
+    if(!isTeacher) return;
+    const key = `${x},${y}`;
+    const cur = tiles[key];
+    if(tool==='erase'){
+      if(cur) placeTile(key, null);
+      return;
+    }
+    if(tool==='desk' || tool==='blackboard' || tool==='teacherDesk'){
+      if(cur && cur.type===tool){ placeTile(key, null); }
+      else { placeTile(key, { type: tool }); }
+      return;
+    }
+    // tool === 'assign': 탭 폴백 — selected가 있고 desk이면 적용
+    if(selected && cur && cur.type==='desk'){
+      if(selected.kind==='student') dropStudentOnTile(selected.id, key);
+      else dropRoleOnTile(selected.id, key);
+      setSelected(null);
+    }
+  };
+
+  /* ---------- DnD 핸들러 ---------- */
+  const onChipDragStart = (e, kind, id)=>{
+    if(!isTeacher) return;
+    const payload = JSON.stringify({kind, id});
+    try{ e.dataTransfer.setData('application/x-seat', payload); }catch(_){}
+    try{ e.dataTransfer.setData('text/plain', payload); }catch(_){}
+    e.dataTransfer.effectAllowed = 'move';
+    setDragging({kind, id});
+  };
+  const onChipDragEnd = ()=>{
+    setDragging(null);
+    setHoverKey(null);
+  };
+  const onTileDragOver = (e, x, y)=>{
+    if(!isTeacher || !dragging) return;
+    const key = `${x},${y}`;
+    const t = tiles[key];
+    if(t && t.type==='desk'){
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      setHoverKey(key);
+    } else {
+      setHoverKey(key+'_reject');
+    }
+  };
+  const onTileDragLeave = ()=>{
+    // hover 표시는 다음 dragOver에서 갱신됨
+  };
+  const onTileDrop = (e, x, y)=>{
+    if(!isTeacher) { setDragging(null); setHoverKey(null); return; }
+    e.preventDefault();
+    const key = `${x},${y}`;
+    const tile = tiles[key];
+    setHoverKey(null);
+    if(!tile || tile.type!=='desk'){ setDragging(null); return; }
+    let raw = '';
+    try{ raw = e.dataTransfer.getData('application/x-seat'); }catch(_){}
+    if(!raw){ try{ raw = e.dataTransfer.getData('text/plain'); }catch(_){} }
+    if(!raw && dragging){ raw = JSON.stringify(dragging); }
+    setDragging(null);
+    if(!raw) return;
+    try{
+      const obj = JSON.parse(raw);
+      if(obj.kind==='student') dropStudentOnTile(obj.id, key);
+      else if(obj.kind==='role') dropRoleOnTile(obj.id, key);
+    }catch(_){}
+  };
+
+  /* ---------- 칩 탭 (모바일 폴백) ---------- */
+  const toggleSelect = (kind, id)=>{
+    if(!isTeacher) return;
+    setSelected(prev=>{
+      if(prev && prev.kind===kind && prev.id===id) return null;
+      return {kind, id};
+    });
+  };
+
+  /* ---------- 어떤 학생/역할이 이미 배치됐는지 ---------- */
+  const assignedStudentIds = new Set();
+  const assignedRoleIds = new Set();
+  Object.values(tiles).forEach(t=>{
+    if(t && t.type==='desk'){
+      if(t.studentId) assignedStudentIds.add(t.studentId);
+      if(t.roleId) assignedRoleIds.add(t.roleId);
+    }
+  });
+
+  /* ---------- 타일 렌더 ---------- */
+  const renderTile = (x,y)=>{
+    const key = `${x},${y}`;
+    const t = tiles[key];
+    const isHover = hoverKey === key;
+    const isHoverReject = hoverKey === key+'_reject';
+    const baseCls = "relative rounded-md border-2 flex items-center justify-center text-center p-1 overflow-hidden select-none aspect-square";
+    const cursorCls = isTeacher ? 'cursor-pointer hover:ring-2 hover:ring-blue-300' : 'cursor-default';
+
+    const dragOverProps = isTeacher ? {
+      onDragOver:(e)=>onTileDragOver(e,x,y),
+      onDragLeave:onTileDragLeave,
+      onDrop:(e)=>onTileDrop(e,x,y)
+    } : {};
+
+    if(!t){
+      return (
+        <div key={key} onClick={()=>handleTileClick(x,y)} {...dragOverProps}
+          className={`${baseCls} ${cursorCls} border-dashed border-gray-200 bg-gray-50/30 text-gray-300 ${isHoverReject?'ring-2 ring-red-400':''}`}>
+          {isTeacher && tool!=='assign' && tool!=='erase' && <span className="text-xs">＋</span>}
+        </div>
+      );
+    }
+    if(t.type==='blackboard'){
+      return (<div key={key} onClick={()=>handleTileClick(x,y)} {...dragOverProps}
+        className={`${baseCls} ${cursorCls} bg-emerald-800 text-emerald-50 border-emerald-900 ${isHoverReject?'ring-2 ring-red-400':''}`}>
+        <div className="font-bold text-[10px] sm:text-xs leading-tight">📋<br/>칠판</div></div>);
+    }
+    if(t.type==='teacherDesk'){
+      return (<div key={key} onClick={()=>handleTileClick(x,y)} {...dragOverProps}
+        className={`${baseCls} ${cursorCls} bg-violet-200 text-violet-900 border-violet-500 ${isHoverReject?'ring-2 ring-red-400':''}`}>
+        <div className="font-bold text-[10px] sm:text-xs leading-tight">👨‍🏫<br/>선생님</div></div>);
+    }
+    // desk
+    const student = t.studentId ? data.students.find(s=>s.id===t.studentId) : null;
+    const role = t.roleId ? data.roles.find(r=>r.id===t.roleId) : null;
+    const filled = student && role;
+    // 호버 ring 색상: 빈 desk 또는 같은 종류 교체 의도
+    let ringCls = '';
+    if(isHover && dragging){
+      const sameKind =
+        (dragging.kind==='student' && t.studentId) ||
+        (dragging.kind==='role' && t.roleId);
+      ringCls = sameKind ? 'ring-2 ring-amber-400' : 'ring-2 ring-blue-400';
+    }
+    return (
+      <div key={key} onClick={()=>handleTileClick(x,y)} {...dragOverProps}
+        className={`${baseCls} ${cursorCls} border-amber-500 ${filled?'bg-amber-100':'bg-amber-50'} text-amber-900 ${ringCls}`}>
+        <div className="leading-tight min-w-0 w-full">
+          {student
+            ? <div className="font-bold text-xs sm:text-sm whitespace-normal break-keep">{student.name}{student.gender==='M'?'👦':'👧'}</div>
+            : <div className="text-gray-400 text-[10px]">빈 자리</div>}
+          {role
+            ? <div className="text-[10px] sm:text-[11px] text-amber-800 whitespace-normal break-keep leading-tight line-clamp-2 mt-0.5">📌 {role.name}</div>
+            : <div className="text-[10px] text-gray-400 mt-0.5">역할 없음</div>}
+        </div>
+        {isTeacher && (student || role) && (
+          <div className="absolute top-0.5 right-0.5 flex flex-col gap-0.5 opacity-80">
+            {student && (
+              <button title="학생 비우기" onClick={(e)=>{e.stopPropagation(); clearTileStudent(key);}}
+                className="w-4 h-4 leading-none text-[9px] bg-white border border-red-300 text-red-600 rounded hover:bg-red-100">×</button>
+            )}
+            {role && (
+              <button title="역할 비우기" onClick={(e)=>{e.stopPropagation(); clearTileRole(key);}}
+                className="w-4 h-4 leading-none text-[9px] bg-white border border-amber-300 text-amber-700 rounded hover:bg-amber-100">−</button>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  };
+  const board = [];
+  for(let y=0; y<rows; y++){ for(let x=0; x<cols; x++){ board.push(renderTile(x,y)); } }
+
+  const changeSize = (deltaC, deltaR)=>{
+    setData(prev=>{
+      const nd = structuredClone(prev);
+      const lay = ensureLayout(nd);
+      const nc = Math.max(3, Math.min(16, (lay.cols||8)+deltaC));
+      const nr = Math.max(3, Math.min(16, (lay.rows||8)+deltaR));
+      Object.keys(lay.tiles).forEach(k=>{
+        const [x,y] = k.split(',').map(Number);
+        if(x>=nc || y>=nr){
+          const t = lay.tiles[k];
+          if(t && t.type==='desk') detachRoleFromStudent(nd, t.studentId, t.roleId);
+          delete lay.tiles[k];
+        }
+      });
+      lay.cols = nc; lay.rows = nr;
+      return nd;
+    });
+  };
+
+  /* ---------- 좌·우 사이드바 ---------- */
+  const sortedStudents = [...data.students].sort((a,b)=>a.number-b.number);
+
+  const StudentChip = ({s})=>{
+    const isAssigned = assignedStudentIds.has(s.id);
+    const isSelected = selected && selected.kind==='student' && selected.id===s.id;
+    const draggable = isTeacher && !isAssigned;
+    return (
+      <div
+        draggable={draggable}
+        onDragStart={(e)=>draggable && onChipDragStart(e,'student',s.id)}
+        onDragEnd={onChipDragEnd}
+        onClick={()=>!isAssigned && toggleSelect('student', s.id)}
+        className={`flex items-center justify-between gap-1 px-2 py-1.5 rounded-lg border-2 text-xs
+          ${isAssigned
+            ? 'opacity-40 line-through cursor-not-allowed bg-gray-100 border-gray-200'
+            : (isTeacher ? 'bg-white border-gray-300 cursor-grab hover:border-blue-400' : 'bg-white border-gray-200')}
+          ${isSelected ? 'ring-2 ring-blue-500 border-blue-500' : ''}`}>
+        <div className="flex items-center gap-1 min-w-0">
+          <span className="text-[10px] text-gray-500 shrink-0">{s.number}.</span>
+          <span className="font-semibold truncate">{s.name}</span>
+          <span className="text-[10px] shrink-0">{s.gender==='M'?'👦':'👧'}</span>
+          {s.position && (
+            <span className="text-[10px] shrink-0">{POS[s.position].emoji}</span>
+          )}
+          {isSelected && <span className="text-[10px] text-blue-600 shrink-0">🎯</span>}
+        </div>
+        {isTeacher && (
+          <button
+            disabled={!isAssigned}
+            onClick={(e)=>{e.stopPropagation(); if(isAssigned) removeStudentEverywhere(s.id);}}
+            title={isAssigned?'이 학생의 자리 비우기':'배치되지 않음'}
+            className={`shrink-0 w-4 h-4 leading-none text-[10px] rounded border
+              ${isAssigned?'bg-white border-red-300 text-red-600 hover:bg-red-50':'opacity-30 cursor-not-allowed border-gray-300 text-gray-400'}`}>
+            ×
+          </button>
+        )}
+      </div>
+    );
+  };
+  const RoleChip = ({r})=>{
+    const isAssigned = assignedRoleIds.has(r.id);
+    const isSelected = selected && selected.kind==='role' && selected.id===r.id;
+    const draggable = isTeacher && !isAssigned;
+    return (
+      <div
+        draggable={draggable}
+        onDragStart={(e)=>draggable && onChipDragStart(e,'role',r.id)}
+        onDragEnd={onChipDragEnd}
+        onClick={()=>!isAssigned && toggleSelect('role', r.id)}
+        className={`flex items-center justify-between gap-1 px-2 py-1.5 rounded-lg border-2 text-xs
+          ${isAssigned
+            ? 'opacity-40 line-through cursor-not-allowed bg-amber-50 border-amber-200'
+            : (isTeacher ? 'bg-white border-amber-300 cursor-grab hover:border-amber-500' : 'bg-white border-amber-200')}
+          ${isSelected ? 'ring-2 ring-amber-500 border-amber-500' : ''}`}>
+        <div className="flex items-center gap-1 min-w-0">
+          <span className="text-amber-700 shrink-0">📌</span>
+          <span className="font-semibold truncate">{r.name}</span>
+          {isSelected && <span className="text-[10px] text-amber-700 shrink-0">🎯</span>}
+        </div>
+        {isTeacher && (
+          <button
+            disabled={!isAssigned}
+            onClick={(e)=>{e.stopPropagation(); if(isAssigned) removeRoleEverywhere(r.id);}}
+            title={isAssigned?'이 역할의 자리 비우기':'배치되지 않음'}
+            className={`shrink-0 w-4 h-4 leading-none text-[10px] rounded border
+              ${isAssigned?'bg-white border-amber-400 text-amber-700 hover:bg-amber-100':'opacity-30 cursor-not-allowed border-gray-300 text-gray-400'}`}>
+            ×
+          </button>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="bg-white rounded-2xl shadow p-4">
+        <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+          <h3 className="font-bold text-lg">🪑 학생 자리 배치표</h3>
+          <div className="text-xs text-gray-500">{isTeacher ? '도구 선택 후 타일 클릭 / DnD' : '👁 조회 전용'}</div>
+        </div>
+        {isTeacher && (
+          <div className="mb-3 p-2 bg-gray-50 rounded-lg border border-gray-200">
+            <div className="flex flex-wrap gap-1 mb-1">
+              {Object.keys(TOOL_LABELS).map(k=>(
+                <button key={k} onClick={()=>{setTool(k); setSelected(null);}}
+                  className={`px-3 py-1.5 text-sm rounded-lg border-2 font-semibold transition
+                    ${tool===k?'bg-violet-600 text-white border-violet-600':'bg-white border-gray-200 hover:bg-gray-100'}`}>
+                  {TOOL_LABELS[k].label}
+                </button>
+              ))}
+            </div>
+            <div className="text-xs text-gray-500">💡 {TOOL_LABELS[tool].desc}</div>
+            {tool==='assign' && (
+              <div className="text-[11px] text-blue-700 mt-1">
+                💡 학생/역할은 좌·우 패널에서 책상으로 끌어다 놓으세요. (모바일은 칩 → 책상 탭)
+              </div>
+            )}
+            <div className="mt-2 flex flex-wrap gap-1 items-center">
+              <span className="text-xs text-gray-500 mr-1">보드 크기:</span>
+              <button onClick={()=>changeSize(-1,0)} className="px-2 py-1 text-xs bg-white border rounded">가로 -</button>
+              <button onClick={()=>changeSize(1,0)}  className="px-2 py-1 text-xs bg-white border rounded">가로 +</button>
+              <button onClick={()=>changeSize(0,-1)} className="px-2 py-1 text-xs bg-white border rounded">세로 -</button>
+              <button onClick={()=>changeSize(0,1)}  className="px-2 py-1 text-xs bg-white border rounded">세로 +</button>
+              <span className="ml-2 text-xs text-gray-500">현재: {cols} × {rows}</span>
+            </div>
+          </div>
+        )}
+
+        {isTeacher ? (
+          <div className="grid grid-cols-1 md:grid-cols-[180px_minmax(0,1fr)_180px] gap-3">
+            {/* 좌측 학생 사이드바 */}
+            <aside className="md:sticky md:top-2 md:max-h-[80vh] md:overflow-y-auto scrollbar-soft order-2 md:order-1">
+              <div className="text-xs font-bold text-gray-700 mb-1">👥 학생 (번호순)</div>
+              <div className="grid grid-cols-2 md:grid-cols-1 gap-1">
+                {sortedStudents.map(s=><StudentChip key={s.id} s={s}/>)}
+              </div>
+            </aside>
+
+            {/* 중앙 보드 */}
+            <div className="order-1 md:order-2 w-full overflow-x-auto">
+              <div className="grid gap-1 mx-auto"
+                   style={{
+                     gridTemplateColumns:`repeat(${cols}, minmax(64px, 1fr))`,
+                     maxWidth: `${cols*96}px`,
+                     minWidth: `${cols*64}px`
+                   }}>
+                {board}
+              </div>
+            </div>
+
+            {/* 우측 역할 사이드바 */}
+            <aside className="md:sticky md:top-2 md:max-h-[80vh] md:overflow-y-auto scrollbar-soft order-3">
+              <div className="text-xs font-bold text-gray-700 mb-1">📌 역할</div>
+              <div className="grid grid-cols-2 md:grid-cols-1 gap-1">
+                {data.roles.map(r=><RoleChip key={r.id} r={r}/>)}
+              </div>
+            </aside>
+          </div>
+        ) : (
+          // 학생 모드: 사이드바 숨김, 보드만
+          <div className="w-full overflow-x-auto">
+            <div className="grid gap-1 mx-auto"
+                 style={{
+                   gridTemplateColumns:`repeat(${cols}, minmax(64px, 1fr))`,
+                   maxWidth: `${cols*96}px`,
+                   minWidth: `${cols*64}px`
+                 }}>
+              {board}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+/* ============================================================
+   이력
+============================================================ */
+function HistoryView({data}){
+  const [filter,setFilter] = useState('all');
+  const filtered = data.history.filter(h=>{
+    if(filter==='all') return true;
+    if(filter==='point') return h.type==='point';
+    if(filter==='coupon') return h.type==='coupon';
+    if(filter==='role') return h.type==='roleRequest' || h.type==='roleApprove' || h.type==='roleReject';
+    if(filter==='pw') return h.type==='pwChange';
+    return h.actor?.position===filter;
+  });
+  return (
+    <div className="bg-white rounded-2xl shadow p-4">
+      <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
+        <h3 className="font-bold text-lg">📝 변경 이력</h3>
+        <div className="flex gap-1 flex-wrap">
+          {[['all','전체'],['teacher','👨‍🏫'],['president','👑'],['maleVP','💙'],['femaleVP','🌸'],['role','🙋 역할신청'],['point','💰 포인트'],['coupon','🎁 쿠폰'],['pw','🔑 PIN']].map(([k,l])=>(
+            <button key={k} onClick={()=>setFilter(k)}
+              className={`px-2 py-1 text-xs rounded-full border ${filter===k?'bg-blue-600 text-white border-blue-600':'bg-gray-50 border-gray-200'}`}>{l}</button>
+          ))}
+        </div>
+      </div>
+      <ul className="space-y-1 text-sm max-h-[28rem] overflow-auto scrollbar-soft pr-1">
+        {filtered.length===0 && <li className="text-gray-400 text-center p-4">이력이 없어요</li>}
+        {filtered.map(h=>(
+          <li key={h.id} className="p-2 rounded-lg hover:bg-gray-50 border-b last:border-b-0">
+            <div>{h.desc}</div>
+            <div className="text-xs text-gray-400">{h.date} · {h.time}</div>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+/* ============================================================
+   역할 관리
+============================================================ */
+function RoleManager({data, setData, mode, officer}){
+  const isTeacher = mode==='teacher';
+  const [newName,setNewName] = useState('');
+  const editName = (rid,oldName)=>{
+    const v = prompt(`'${oldName}' 새 이름을 입력하세요`, oldName);
+    if(!v || v===oldName) return;
+    setData(prev=>{
+      const nd = structuredClone(prev);
+      const r = nd.roles.find(x=>x.id===rid); if(!r) return prev;
+      r.name = v;
+      const actor = isTeacher
+        ? {position:'teacher', name:'선생님'}
+        : (officer || {position:'student', name:'(알 수 없음)'});
+      nd.history.unshift({
+        id:uid(), type:'roleEdit', date:todayStr(), time:nowHM(), actor,
+        desc:`✏ '${oldName}' → '${v}' 명칭 변경`, ts:Date.now()
+      });
+      return nd;
+    });
+  };
+  const addRole = ()=>{
+    if(!isTeacher || !newName.trim()) return;
+    setData(prev=>{
+      const nd = structuredClone(prev);
+      nd.roles.push({id:uid(), name:newName.trim()});
+      nd.history.unshift({ id:uid(), type:'roleEdit', date:todayStr(), time:nowHM(),
+        actor:{position:'teacher',name:'선생님'},
+        desc:`➕ 새 역할 '${newName.trim()}' 추가`, ts:Date.now() });
+      return nd;
+    });
+    setNewName('');
+  };
+  const removeRole = (rid,name)=>{
+    if(!isTeacher || !confirm(`'${name}' 역할을 삭제할까요?`)) return;
+    setData(prev=>{
+      const nd = structuredClone(prev);
+      nd.roles = nd.roles.filter(r=>r.id!==rid);
+      nd.students.forEach(s=>{ s.roleIds = s.roleIds.filter(x=>x!==rid); });
+      if(nd.layout && nd.layout.tiles){
+        Object.values(nd.layout.tiles).forEach(t=>{
+          if(t && t.type==='desk' && t.roleId===rid){ t.roleId = null; }
+        });
+      }
+      nd.history.unshift({ id:uid(), type:'roleEdit', date:todayStr(), time:nowHM(),
+        actor:{position:'teacher',name:'선생님'},
+        desc:`🗑 역할 '${name}' 삭제`, ts:Date.now() });
+      return nd;
+    });
+  };
+  return (
+    <div className="bg-white rounded-2xl shadow p-4">
+      <h3 className="font-bold text-lg mb-2">📌 1인 1역 항목</h3>
+      <ul className="space-y-2">
+        {data.roles.map(r=>{
+          const owners = data.students.filter(s=>s.roleIds.includes(r.id)).map(s=>s.name).join(', ') || '없음';
+          return (
+            <li key={r.id} className="flex items-center justify-between p-2 bg-gray-50 rounded-lg gap-2 flex-wrap">
+              <div>
+                <div className="font-semibold">{r.name}</div>
+                <div className="text-xs text-gray-500">담당: {owners}</div>
+              </div>
+              <div className="flex gap-1 flex-wrap">
+                <button className="px-2 py-1 text-xs bg-blue-100 text-blue-700 rounded" onClick={()=>editName(r.id,r.name)}>✏ 명칭</button>
+                {isTeacher && <button className="px-2 py-1 text-xs bg-red-100 text-red-700 rounded" onClick={()=>removeRole(r.id,r.name)}>🗑 삭제</button>}
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+      {isTeacher && (
+        <div className="mt-3 flex gap-2">
+          <input className="flex-1 border rounded-lg p-2" placeholder="새 역할 이름" value={newName} onChange={e=>setNewName(e.target.value)} />
+          <button className="px-3 py-2 bg-violet-600 text-white rounded-lg font-semibold" onClick={addRole}>➕ 추가</button>
+        </div>
+      )}
+    </div>
+  );
+}
+/* ============================================================
+   학생 관리 (교사)
+============================================================ */
+function StudentManager({data, setData}){
+  const [editing,setEditing] = useState(null);
+  const newStudent = ()=>setEditing({
+    id:null, name:'', number:data.students.length+1, gender:'M',
+    roleIds:[], position:null, points:0, password:DEFAULT_STUDENT_PW
+  });
+  const save = ()=>{
+    if(!editing.name.trim()){ alert('이름을 입력하세요'); return; }
+    setData(prev=>{
+      const nd = structuredClone(prev);
+      if(editing.position){
+        nd.students.forEach(s=>{ if(s.id!==editing.id && s.position===editing.position) s.position=null; });
+      }
+      if(editing.position==='maleVP' && editing.gender!=='M'){ alert('남부회장은 남학생만'); return prev; }
+      if(editing.position==='femaleVP' && editing.gender!=='F'){ alert('여부회장은 여학생만'); return prev; }
+      if(editing.id){
+        const idx = nd.students.findIndex(s=>s.id===editing.id);
+        nd.students[idx] = editing;
+      } else {
+        nd.students.push({...editing, id:uid()});
+      }
+      nd.history.unshift({ id:uid(), type:'studentEdit', date:todayStr(), time:nowHM(),
+        actor:{position:'teacher',name:'선생님'},
+        desc:`👤 '${editing.name}' 학생 정보 ${editing.id?'수정':'추가'}`, ts:Date.now() });
+      return nd;
+    });
+    setEditing(null);
+  };
+  const remove = (s)=>{
+    if(!confirm(`'${s.name}' 학생을 삭제할까요?`)) return;
+    setData(prev=>{
+      const nd = structuredClone(prev);
+      nd.students = nd.students.filter(x=>x.id!==s.id);
+      Object.keys(nd.checks).forEach(d=>{ delete nd.checks[d][s.id]; });
+      if(nd.roleRequests){
+        Object.keys(nd.roleRequests).forEach(d=>{ if(nd.roleRequests[d]) delete nd.roleRequests[d][s.id]; });
+      }
+      if(nd.layout && nd.layout.tiles){
+        Object.values(nd.layout.tiles).forEach(t=>{
+          if(t && t.type==='desk' && t.studentId===s.id){ t.studentId=null; t.roleId=null; }
+        });
+      }
+      nd.ownedCoupons = (nd.ownedCoupons||[]).filter(oc=>oc.studentId!==s.id);
+      nd.history.unshift({ id:uid(), type:'studentEdit', date:todayStr(), time:nowHM(),
+        actor:{position:'teacher',name:'선생님'},
+        desc:`🗑 '${s.name}' 학생 삭제`, ts:Date.now() });
+      return nd;
+    });
+  };
+  const resetPw = (s)=>{
+    if(!confirm(`'${s.name}'의 비밀번호를 '${DEFAULT_STUDENT_PW}'로 초기화할까요?`)) return;
+    setData(prev=>{
+      const nd = structuredClone(prev);
+      const x = nd.students.find(y=>y.id===s.id);
+      if(x) x.password = DEFAULT_STUDENT_PW;
+      nd.history.unshift({ id:uid(), type:'studentEdit', date:todayStr(), time:nowHM(),
+        actor:{position:'teacher',name:'선생님'},
+        desc:`🔑 '${s.name}' 비밀번호 초기화`, ts:Date.now() });
+      return nd;
+    });
+  };
+  const setPw = (s)=>{
+    const v = prompt(`'${s.name}'의 새 비밀번호`, s.password || DEFAULT_STUDENT_PW);
+    if(!v) return;
+    setData(prev=>{
+      const nd = structuredClone(prev);
+      const x = nd.students.find(y=>y.id===s.id);
+      if(x) x.password = v;
+      nd.history.unshift({ id:uid(), type:'studentEdit', date:todayStr(), time:nowHM(),
+        actor:{position:'teacher',name:'선생님'},
+        desc:`🔑 '${s.name}' 비밀번호 변경`, ts:Date.now() });
+      return nd;
+    });
+  };
+  const sorted = [...data.students].sort((a,b)=>a.number-b.number);
+  return (
+    <div className="bg-white rounded-2xl shadow p-4">
+      <div className="flex items-center justify-between mb-2">
+        <h3 className="font-bold text-lg">👨‍👩‍👧 학생 명단</h3>
+        <button className="px-3 py-1.5 bg-violet-600 text-white rounded-lg text-sm font-semibold" onClick={newStudent}>➕ 학생 추가</button>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead className="bg-gray-50">
+            <tr>
+              <th className="p-2 text-left">번호</th>
+              <th className="p-2 text-left">이름</th>
+              <th className="p-2 text-left">성별</th>
+              <th className="p-2 text-left">직책</th>
+              <th className="p-2 text-left">💰 P</th>
+              <th className="p-2 text-left">🔑 비번</th>
+              <th className="p-2"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {sorted.map(s=>(
+              <tr key={s.id} className="border-t">
+                <td className="p-2">{s.number}</td>
+                <td className="p-2 font-semibold">{s.name}</td>
+                <td className="p-2">{s.gender==='M'?'👦':'👧'}</td>
+                <td className="p-2">{s.position?<Badge position={s.position}/>:<span className="text-gray-400">-</span>}</td>
+                <td className="p-2 font-bold text-emerald-700">{s.points||0}P</td>
+                <td className="p-2">
+                  <code className="text-xs bg-gray-100 px-1 rounded">{s.password || DEFAULT_STUDENT_PW}</code>
+                </td>
+                <td className="p-2 text-right whitespace-nowrap">
+                  <button className="px-2 py-1 text-xs bg-blue-100 text-blue-700 rounded mr-1" onClick={()=>setEditing({...s})}>✏</button>
+                  <button className="px-2 py-1 text-xs bg-yellow-100 text-yellow-700 rounded mr-1" onClick={()=>setPw(s)}>🔑 변경</button>
+                  <button className="px-2 py-1 text-xs bg-gray-100 text-gray-700 rounded mr-1" onClick={()=>resetPw(s)}>♻ 초기화</button>
+                  <button className="px-2 py-1 text-xs bg-red-100 text-red-700 rounded" onClick={()=>remove(s)}>🗑</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <Modal open={!!editing} onClose={()=>setEditing(null)} title={editing?.id?'학생 수정':'학생 추가'} wide>
+        {editing && (
+          <div className="space-y-3">
+            <div className="grid grid-cols-2 gap-2">
+              <label className="block">
+                <div className="text-xs text-gray-500">번호</div>
+                <input type="number" className="border rounded p-2 w-full" value={editing.number} onChange={e=>setEditing({...editing, number:parseInt(e.target.value)||0})}/>
+              </label>
+              <label className="block">
+                <div className="text-xs text-gray-500">이름</div>
+                <input className="border rounded p-2 w-full" value={editing.name} onChange={e=>setEditing({...editing, name:e.target.value})}/>
+              </label>
+              <label className="block">
+                <div className="text-xs text-gray-500">성별</div>
+                <select className="border rounded p-2 w-full" value={editing.gender} onChange={e=>{
+                  const g=e.target.value; let p=editing.position;
+                  if(p==='maleVP'&&g!=='M') p=null; if(p==='femaleVP'&&g!=='F') p=null;
+                  setEditing({...editing, gender:g, position:p});
+                }}>
+                  <option value="M">👦 남</option><option value="F">👧 여</option>
+                </select>
+              </label>
+              <label className="block">
+                <div className="text-xs text-gray-500">학급임원 직책</div>
+                <select className="border rounded p-2 w-full" value={editing.position||''} onChange={e=>setEditing({...editing, position:e.target.value||null})}>
+                  <option value="">없음</option>
+                  <option value="president">👑 회장</option>
+                  {editing.gender==='M' && <option value="maleVP">💙 남부회장</option>}
+                  {editing.gender==='F' && <option value="femaleVP">🌸 여부회장</option>}
+                </select>
+              </label>
+              <label className="block">
+                <div className="text-xs text-gray-500">💰 포인트</div>
+                <input type="number" className="border rounded p-2 w-full" value={editing.points||0} onChange={e=>setEditing({...editing, points:parseInt(e.target.value)||0})}/>
+              </label>
+              <label className="block">
+                <div className="text-xs text-gray-500">🔑 비밀번호</div>
+                <input className="border rounded p-2 w-full" value={editing.password||DEFAULT_STUDENT_PW} onChange={e=>setEditing({...editing, password:e.target.value})}/>
+              </label>
+            </div>
+            <div>
+              <div className="text-xs text-gray-500 mb-1">담당 역할</div>
+              <div className="flex flex-wrap gap-1">
+                {data.roles.map(r=>{
+                  const on = editing.roleIds.includes(r.id);
+                  return (
+                    <button key={r.id} type="button"
+                      onClick={()=>setEditing({...editing, roleIds: on?editing.roleIds.filter(x=>x!==r.id):[...editing.roleIds,r.id]})}
+                      className={`px-2 py-1 text-sm rounded-full border ${on?'bg-violet-600 text-white border-violet-600':'bg-gray-50'}`}>
+                      {on?'✓ ':''}{r.name}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+            <div className="flex gap-2">
+              <button className="flex-1 p-2 bg-gray-200 rounded-lg" onClick={()=>setEditing(null)}>취소</button>
+              <button className="flex-1 p-2 bg-violet-600 text-white rounded-lg font-bold" onClick={save}>저장</button>
+            </div>
+          </div>
+        )}
+      </Modal>
+    </div>
+  );
+}
+/* ============================================================
+   🎟 쿠폰 티켓 / 학생·교사용
+============================================================ */
+function Barcode(){
+  const widths = [2,1,3,1,2,1,1,3,2,1,2,3,1,2,1,2,1,3,1,2,2,1,3,1,2,1,2];
+  return (
+    <div className="barcode">
+      {widths.map((w,i)=>(<span key={i} style={{width:`${w}px`}} />))}
+    </div>
+  );
+}
+function CouponTicket({coupon, status='active', children}){
+  return (
+    <div className={`coupon-ticket ${status==='used'?'used':''} ${status==='pending'?'pending':''}`}>
+      <Barcode/>
+      <div className="text-center">
+        <div className="text-5xl mb-1">{coupon.emoji || '🎁'}</div>
+        <div className="font-extrabold text-xl text-gray-800 mb-1">{coupon.name}</div>
+        <div className="text-sm text-gray-500 font-semibold">{coupon.price}P</div>
+      </div>
+      <div className="mt-3 pt-2 border-t border-dashed border-gray-300 text-[9px] text-gray-500 leading-tight text-center">
+        <div>사용기간: 학년이 바뀌기 전까지</div>
+        <div>교환처: 담임 선생님</div>
+        <div className="mt-0.5">&lt;쿠폰은 상대방과 교환하거나 줄 수 없습니다&gt;</div>
+      </div>
+      {children}
+    </div>
+  );
+}
+function CouponStore({data, setData, student, onLogout, hideLogout=false}){
+  const me = data.students.find(s=>s.id===student.id) || student;
+  const myOwned = (data.ownedCoupons||[]).filter(oc=>oc.studentId===me.id);
+  const activeOwned = myOwned.filter(oc=>oc.status==='active');
+  const pendingOwned = myOwned.filter(oc=>oc.status==='pending');
+
+  const buy = (coupon)=>{
+    if((me.points||0) < coupon.price){ alert('포인트가 부족해요'); return; }
+    if(!confirm(`'${coupon.name}' (${coupon.price}P) 구매할까요?`)) return;
+    setData(prev=>{
+      const nd = structuredClone(prev);
+      const s = nd.students.find(x=>x.id===me.id);
+      if(!s) return prev;
+      if((s.points||0) < coupon.price){ return prev; }
+      const before = s.points||0;
+      s.points = before - coupon.price;
+      const owned = {
+        id: uid(),
+        couponId: coupon.id,
+        studentId: s.id,
+        status: 'active',
+        purchasedAt: Date.now()
+      };
+      nd.ownedCoupons = [...(nd.ownedCoupons||[]), owned];
+      nd.history.unshift({
+        id:uid(), type:'coupon', date:todayStr(), time:nowHM(),
+        actor:{position:'student', name:s.name},
+        desc:`🛒 ${s.name}이(가) '${coupon.name}' 구매 (-${coupon.price}P) (${before}P → ${s.points}P)`,
+        ts: Date.now()
+      });
+      return nd;
+    });
+  };
+  const requestUse = (owned, coupon)=>{
+    if(!confirm(`'${coupon.name}' 사용을 선생님께 요청할까요?`)) return;
+    setData(prev=>{
+      const nd = structuredClone(prev);
+      const o = nd.ownedCoupons.find(x=>x.id===owned.id);
+      if(!o || o.status!=='active') return prev;
+      o.status = 'pending';
+      o.requestedAt = Date.now();
+      nd.history.unshift({
+        id:uid(), type:'coupon', date:todayStr(), time:nowHM(),
+        actor:{position:'student', name:me.name},
+        desc:`✋ ${me.name}이(가) '${coupon.name}' 사용 요청 (승인 대기)`,
+        ts: Date.now()
+      });
+      return nd;
+    });
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="bg-white rounded-2xl shadow p-4 flex items-center justify-between flex-wrap gap-2">
+        <div>
+          <div className="text-sm text-gray-500">로그인</div>
+          <div className="text-xl font-bold">
+            {me.gender==='M'?'👦':'👧'} {me.name}
+            {me.position && <span className="ml-2"><Badge position={me.position}/></span>}
+          </div>
+        </div>
+        <div className="flex items-center gap-3">
+          <div className="text-right">
+            <div className="text-xs text-gray-500">내 포인트</div>
+            <div className="text-2xl font-extrabold text-emerald-600">💰 {me.points||0}P</div>
+          </div>
+          {!hideLogout && (
+            <button onClick={onLogout}
+              className="px-3 py-2 bg-gray-200 hover:bg-gray-300 rounded-lg text-sm font-bold">🚪 로그아웃</button>
+          )}
+        </div>
+      </div>
+
+      <div className="bg-white rounded-2xl shadow p-4">
+        <h3 className="font-bold text-lg mb-3">🎫 내 쿠폰함 ({activeOwned.length + pendingOwned.length}장)</h3>
+        {(activeOwned.length+pendingOwned.length)===0 ? (
+          <div className="text-sm text-gray-400 text-center p-4">아직 보유한 쿠폰이 없어요</div>
+        ) : (
+          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {pendingOwned.map(oc=>{
+              const c = data.coupons.find(x=>x.id===oc.couponId);
+              if(!c) return null;
+              return (
+                <div key={oc.id}>
+                  <CouponTicket coupon={c} status="pending">
+                    <div className="mt-2 text-center">
+                      <div className="text-xs font-bold text-amber-700">⏳ 승인 대기 중</div>
+                    </div>
+                  </CouponTicket>
+                </div>
+              );
+            })}
+            {activeOwned.map(oc=>{
+              const c = data.coupons.find(x=>x.id===oc.couponId);
+              if(!c) return null;
+              return (
+                <div key={oc.id}>
+                  <CouponTicket coupon={c} status="active"/>
+                  <button onClick={()=>requestUse(oc, c)}
+                    className="mt-2 w-full p-2 bg-blue-500 hover:bg-blue-600 text-white rounded-lg font-bold text-sm">
+                    ✋ 사용하기
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      <div className="bg-white rounded-2xl shadow p-4">
+        <h3 className="font-bold text-lg mb-3">🛒 쿠폰 상점</h3>
+        {data.coupons.length===0 ? (
+          <div className="text-sm text-gray-400 text-center p-4">선생님이 등록한 쿠폰이 없어요</div>
+        ) : (
+          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {data.coupons.map(c=>{
+              const canBuy = (me.points||0) >= c.price;
+              return (
+                <div key={c.id}>
+                  <CouponTicket coupon={c}/>
+                  <button onClick={()=>buy(c)} disabled={!canBuy}
+                    className={`mt-2 w-full p-2 rounded-lg font-bold text-sm
+                      ${canBuy?'bg-emerald-500 hover:bg-emerald-600 text-white':'bg-gray-200 text-gray-400 cursor-not-allowed'}`}>
+                    {canBuy ? `🛒 ${c.price}P로 구매` : `💸 포인트 부족 (${c.price}P 필요)`}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+function CouponManager({data, setData}){
+  const [form, setForm] = useState({name:'', price:10, emoji:'🎁'});
+  const [editing, setEditing] = useState(null);
+  const pending = (data.ownedCoupons||[]).filter(oc=>oc.status==='pending');
+
+  const create = ()=>{
+    if(!form.name.trim()){ alert('쿠폰명을 입력하세요'); return; }
+    const price = parseInt(form.price);
+    if(!price || price<0){ alert('가격을 입력하세요'); return; }
+    setData(prev=>{
+      const nd = structuredClone(prev);
+      nd.coupons.push({ id:uid(), name:form.name.trim(), price, emoji:form.emoji||'🎁' });
+      nd.history.unshift({
+        id:uid(), type:'coupon', date:todayStr(), time:nowHM(),
+        actor:{position:'teacher',name:'선생님'},
+        desc:`➕ 새 쿠폰 '${form.name.trim()}' (${price}P) 발행`, ts: Date.now()
+      });
+      return nd;
+    });
+    setForm({name:'', price:10, emoji:'🎁'});
+  };
+  const saveEdit = ()=>{
+    if(!editing) return;
+    setData(prev=>{
+      const nd = structuredClone(prev);
+      const c = nd.coupons.find(x=>x.id===editing.id);
+      if(!c) return prev;
+      c.name = editing.name; c.price = parseInt(editing.price)||0; c.emoji = editing.emoji||'🎁';
+      nd.history.unshift({
+        id:uid(), type:'coupon', date:todayStr(), time:nowHM(),
+        actor:{position:'teacher',name:'선생님'},
+        desc:`✏ 쿠폰 '${c.name}' 수정 (${c.price}P)`, ts: Date.now()
+      });
+      return nd;
+    });
+    setEditing(null);
+  };
+  const remove = (c)=>{
+    if(!confirm(`'${c.name}' 쿠폰을 삭제할까요? (이미 구매된 쿠폰은 유지됩니다)`)) return;
+    setData(prev=>{
+      const nd = structuredClone(prev);
+      nd.coupons = nd.coupons.filter(x=>x.id!==c.id);
+      nd.history.unshift({
+        id:uid(), type:'coupon', date:todayStr(), time:nowHM(),
+        actor:{position:'teacher',name:'선생님'},
+        desc:`🗑 쿠폰 '${c.name}' 삭제`, ts: Date.now()
+      });
+      return nd;
+    });
+  };
+  const approve = (oc)=>{
+    const c = data.coupons.find(x=>x.id===oc.couponId);
+    const stu = data.students.find(s=>s.id===oc.studentId);
+    if(!confirm(`'${stu?.name}'의 '${c?.name}' 사용을 승인할까요?`)) return;
+    setData(prev=>{
+      const nd = structuredClone(prev);
+      const o = nd.ownedCoupons.find(x=>x.id===oc.id);
+      if(!o) return prev;
+      o.status = 'used';
+      o.processedAt = Date.now();
+      nd.history.unshift({
+        id:uid(), type:'coupon', date:todayStr(), time:nowHM(),
+        actor:{position:'teacher',name:'선생님'},
+        desc:`✅ 👨‍🏫 선생님이 ${stu?.name}의 '${c?.name}' 사용 승인 (사용 완료)`,
+        ts: Date.now()
+      });
+      return nd;
+    });
+  };
+  const reject = (oc)=>{
+    const c = data.coupons.find(x=>x.id===oc.couponId);
+    const stu = data.students.find(s=>s.id===oc.studentId);
+    if(!confirm(`'${stu?.name}'의 '${c?.name}' 사용을 반려할까요? (다시 보유 상태로 되돌립니다)`)) return;
+    setData(prev=>{
+      const nd = structuredClone(prev);
+      const o = nd.ownedCoupons.find(x=>x.id===oc.id);
+      if(!o) return prev;
+      o.status = 'active';
+      o.requestedAt = null;
+      nd.history.unshift({
+        id:uid(), type:'coupon', date:todayStr(), time:nowHM(),
+        actor:{position:'teacher',name:'선생님'},
+        desc:`↩ 👨‍🏫 선생님이 ${stu?.name}의 '${c?.name}' 사용 요청 반려`,
+        ts: Date.now()
+      });
+      return nd;
+    });
+  };
+  const stuSummary = data.students.map(s=>{
+    const all = (data.ownedCoupons||[]).filter(o=>o.studentId===s.id);
+    return {
+      ...s,
+      active: all.filter(o=>o.status==='active').length,
+      pending: all.filter(o=>o.status==='pending').length,
+      used: all.filter(o=>o.status==='used').length,
+    };
+  }).sort((a,b)=>a.number-b.number);
+
+  return (
+    <div className="space-y-4">
+      <div className="bg-white rounded-2xl shadow p-4">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="font-bold text-lg">🔔 승인 대기 목록 <span className="text-amber-600">({pending.length})</span></h3>
+        </div>
+        {pending.length===0 ? (
+          <div className="text-sm text-gray-400 text-center p-4 bg-gray-50 rounded-lg">승인 대기 중인 요청이 없어요</div>
+        ) : (
+          <div className="space-y-2">
+            {pending.map(oc=>{
+              const c = data.coupons.find(x=>x.id===oc.couponId);
+              const stu = data.students.find(s=>s.id===oc.studentId);
+              return (
+                <div key={oc.id} className="p-3 bg-amber-50 border-2 border-amber-300 rounded-xl flex items-center justify-between flex-wrap gap-2">
+                  <div className="flex items-center gap-3">
+                    <div className="text-3xl">{c?.emoji || '🎁'}</div>
+                    <div>
+                      <div className="font-bold">{c?.name || '(삭제된 쿠폰)'} <span className="text-xs text-gray-500">· {c?.price}P</span></div>
+                      <div className="text-sm text-gray-700">👤 {stu?.name || '(알 수 없음)'} 요청</div>
+                      {oc.requestedAt && (
+                        <div className="text-xs text-gray-400">요청: {new Date(oc.requestedAt).toLocaleString('ko-KR')}</div>
+                      )}
+                    </div>
+                  </div>
+                  <div className="flex gap-2">
+                    <button onClick={()=>approve(oc)}
+                      className="px-4 py-2 bg-emerald-500 hover:bg-emerald-600 text-white rounded-lg font-bold">✅ 승인</button>
+                    <button onClick={()=>reject(oc)}
+                      className="px-4 py-2 bg-red-400 hover:bg-red-500 text-white rounded-lg font-bold">↩ 반려</button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      <div className="bg-white rounded-2xl shadow p-4">
+        <h3 className="font-bold text-lg mb-3">➕ 새 쿠폰 발행</h3>
+        <div className="grid sm:grid-cols-5 gap-2 items-end">
+          <label className="sm:col-span-1">
+            <div className="text-xs text-gray-500">이모지</div>
+            <input className="w-full border rounded p-2 text-2xl text-center" value={form.emoji}
+              onChange={e=>setForm({...form, emoji:e.target.value})} placeholder="🎁"/>
+          </label>
+          <label className="sm:col-span-2">
+            <div className="text-xs text-gray-500">쿠폰명</div>
+            <input className="w-full border rounded p-2" value={form.name}
+              onChange={e=>setForm({...form, name:e.target.value})} placeholder="예: 숙제 면제권"/>
+          </label>
+          <label className="sm:col-span-1">
+            <div className="text-xs text-gray-500">가격 (P)</div>
+            <input type="number" className="w-full border rounded p-2" value={form.price}
+              onChange={e=>setForm({...form, price:e.target.value})}/>
+          </label>
+          <button onClick={create}
+            className="sm:col-span-1 p-2 bg-violet-600 text-white rounded font-bold">📢 발행</button>
+        </div>
+        {form.name && (
+          <div className="mt-3 max-w-xs mx-auto">
+            <div className="text-xs text-gray-500 text-center mb-1">미리보기</div>
+            <CouponTicket coupon={{name:form.name, price:parseInt(form.price)||0, emoji:form.emoji}}/>
+          </div>
+        )}
+      </div>
+
+      <div className="bg-white rounded-2xl shadow p-4">
+        <h3 className="font-bold text-lg mb-3">🎟 발행된 쿠폰 ({data.coupons.length}종)</h3>
+        {data.coupons.length===0 ? (
+          <div className="text-sm text-gray-400 text-center p-4">발행된 쿠폰이 없어요</div>
+        ) : (
+          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {data.coupons.map(c=>(
+              <div key={c.id}>
+                <CouponTicket coupon={c}/>
+                <div className="mt-2 flex gap-1">
+                  <button onClick={()=>setEditing({...c})}
+                    className="flex-1 p-2 bg-blue-100 text-blue-700 rounded text-sm font-bold">✏ 수정</button>
+                  <button onClick={()=>remove(c)}
+                    className="flex-1 p-2 bg-red-100 text-red-700 rounded text-sm font-bold">🗑 삭제</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="bg-white rounded-2xl shadow p-4">
+        <h3 className="font-bold text-lg mb-3">📊 학생별 쿠폰 현황</h3>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="bg-gray-50">
+              <tr>
+                <th className="p-2 text-left">번호</th>
+                <th className="p-2 text-left">이름</th>
+                <th className="p-2 text-right">💰 포인트</th>
+                <th className="p-2 text-right">🎫 보유</th>
+                <th className="p-2 text-right">⏳ 대기</th>
+                <th className="p-2 text-right">✅ 사용</th>
+              </tr>
+            </thead>
+            <tbody>
+              {stuSummary.map(s=>(
+                <tr key={s.id} className="border-t">
+                  <td className="p-2">{s.number}</td>
+                  <td className="p-2 font-semibold">{s.name}</td>
+                  <td className="p-2 text-right text-emerald-700 font-bold">{s.points||0}P</td>
+                  <td className="p-2 text-right">{s.active}</td>
+                  <td className="p-2 text-right text-amber-600">{s.pending}</td>
+                  <td className="p-2 text-right text-gray-500">{s.used}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <Modal open={!!editing} onClose={()=>setEditing(null)} title="쿠폰 수정">
+        {editing && (
+          <div className="space-y-3">
+            <label className="block">
+              <div className="text-xs text-gray-500">이모지</div>
+              <input className="w-full border rounded p-2 text-2xl text-center" value={editing.emoji}
+                onChange={e=>setEditing({...editing, emoji:e.target.value})}/>
+            </label>
+            <label className="block">
+              <div className="text-xs text-gray-500">쿠폰명</div>
+              <input className="w-full border rounded p-2" value={editing.name}
+                onChange={e=>setEditing({...editing, name:e.target.value})}/>
+            </label>
+            <label className="block">
+              <div className="text-xs text-gray-500">가격 (P)</div>
+              <input type="number" className="w-full border rounded p-2" value={editing.price}
+                onChange={e=>setEditing({...editing, price:e.target.value})}/>
+            </label>
+            <div className="flex gap-2">
+              <button className="flex-1 p-2 bg-gray-200 rounded-lg" onClick={()=>setEditing(null)}>취소</button>
+              <button className="flex-1 p-2 bg-violet-600 text-white rounded-lg font-bold" onClick={saveEdit}>저장</button>
+            </div>
+          </div>
+        )}
+      </Modal>
+    </div>
+  );
+}
+function CouponTab({data, setData, mode, authedStudent}){
+  if(mode==='teacher'){
+    return <CouponManager data={data} setData={setData}/>;
+  }
+  if(!authedStudent){
+    return <div className="bg-red-50 border border-red-200 rounded-xl p-4 text-sm text-red-700">로그인 정보를 찾을 수 없어요. 모드 전환 후 다시 로그인 해주세요.</div>;
+  }
+  return <CouponStore data={data} setData={setData} student={authedStudent}
+    hideLogout={true} onLogout={()=>{}}/>;
+}
+/* ============================================================
+   선생님 도구 — 헤더 PIN 변경 보조 안내 추가
+============================================================ */
+function TeacherTools({data, setData}){
+  const [tpw,setTpw] = useState('');
+  const fileRef = useRef();
+  const exportJson = ()=>{
+    const blob = new Blob([JSON.stringify(data,null,2)], {type:'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href=url; a.download=`class_duty_${todayStr()}.json`; a.click();
+    URL.revokeObjectURL(url);
+  };
+  const importJson = (e)=>{
+    const f = e.target.files[0]; if(!f) return;
+    const r = new FileReader();
+    r.onload = ()=>{
+      try{
+        const j = JSON.parse(r.result);
+        if(!j.students||!j.roles) throw new Error();
+        if(!j.layout) j.layout = { cols:8, rows:8, tiles:{} };
+        if(!j.coupons) j.coupons = [];
+        if(!j.ownedCoupons) j.ownedCoupons = [];
+        if(!j.roleRequests) j.roleRequests = {};
+        if(!j.passwords) j.passwords = { teacher:'teacher1234', officer:'1234' };
+        if(confirm('현재 데이터를 덮어쓸까요?')) setData(j);
+      }catch(_){ alert('잘못된 파일이에요'); }
+    };
+    r.readAsText(f);
+  };
+  const resetAll = ()=>{
+    if(!confirm('정말 모든 기록을 초기화할까요?')) return;
+    setData(prev=>({ ...prev, checks:{}, history:[], ownedCoupons:[], roleRequests:{} }));
+  };
+  const fullReset = ()=>{
+    if(!confirm('초기 더미로 되돌릴까요?')) return;
+    setData(buildSeed());
+  };
+  return (
+    <div className="bg-white rounded-2xl shadow p-4 space-y-4">
+      <h3 className="font-bold text-lg">⚙ 선생님 관리 도구</h3>
+      <div className="grid sm:grid-cols-2 gap-3">
+        <div className="p-3 bg-violet-50 rounded-xl border border-violet-200">
+          <div className="font-semibold mb-2">🔑 비밀번호 변경</div>
+          <div className="text-xs text-emerald-700 mb-2">💡 헤더 우측 🔑 PIN 변경 버튼으로 더 빠르게 변경할 수 있어요.</div>
+          <div className="space-y-2">
+            <div>
+              <div className="text-xs text-gray-500">선생님 비번 (현재: <code>{data.passwords.teacher}</code>)</div>
+              <div className="flex gap-1">
+                <input className="border rounded p-2 flex-1 text-sm" value={tpw} onChange={e=>setTpw(e.target.value)}/>
+                <button className="px-2 bg-violet-600 text-white rounded text-sm" onClick={()=>{
+                  if(!tpw) return;
+                  setData(p=>({...p, passwords:{...p.passwords, teacher:tpw}})); setTpw(''); alert('변경됨');
+                }}>변경</button>
+              </div>
+            </div>
+            <div className="text-xs text-gray-500">
+              💡 학생 개별 비밀번호는 <b>[👨‍👩‍👧 학생관리]</b> 탭에서 변경할 수 있어요.
+            </div>
+          </div>
+        </div>
+        <div className="p-3 bg-amber-50 rounded-xl border border-amber-200">
+          <div className="font-semibold mb-2">💾 백업 / 복원 / 초기화</div>
+          <div className="flex flex-wrap gap-2">
+            <button className="px-3 py-1.5 bg-amber-500 text-white rounded text-sm" onClick={exportJson}>📤 JSON 내보내기</button>
+            <button className="px-3 py-1.5 bg-amber-500 text-white rounded text-sm" onClick={()=>fileRef.current.click()}>📥 JSON 불러오기</button>
+            <input ref={fileRef} type="file" accept="application/json" className="hidden" onChange={importJson}/>
+            <button className="px-3 py-1.5 bg-orange-500 text-white rounded text-sm" onClick={resetAll}>♻ 기록 초기화</button>
+            <button className="px-3 py-1.5 bg-red-500 text-white rounded text-sm" onClick={fullReset}>🔄 더미로 복원</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+function DatePicker({date,setDate}){
+  return (
+    <input type="date" value={date} onChange={e=>setDate(e.target.value||todayStr())}
+      className="border-2 rounded-lg p-2 text-sm" />
+  );
+}
+function ReadOnlyRoles({data}){
+  return (
+    <div className="bg-white rounded-2xl shadow p-4">
+      <h3 className="font-bold text-lg mb-2">📌 1인 1역 항목 (조회)</h3>
+      <ul className="space-y-2">
+        {data.roles.map(r=>{
+          const owners = data.students.filter(s=>s.roleIds.includes(r.id)).map(s=>s.name).join(', ') || '없음';
+          return (
+            <li key={r.id} className="p-2 bg-gray-50 rounded-lg">
+              <div className="font-semibold">{r.name}</div>
+              <div className="text-xs text-gray-500">담당: {owners}</div>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+/* ============================================================
+   메인 App
+============================================================ */
+function App(){
+  const [data,setData,syncStatus] = useStore();
+  const [mode,setMode] = useState(null);
+  const [authedStudent,setAuthedStudent] = useState(null);
+  const [tab,setTab] = useState('selfCheck');
+  const [date,setDate] = useState(todayStr());
+  const [pinOpen, setPinOpen] = useState(false);
+
+  const me = (authedStudent && data)
+    ? data.students.find(s=>s.id===authedStudent.id)
+    : null;
+  const isOfficer = !!(me && me.position && POS[me.position]);
+  const officerInfo = isOfficer ? { position: me.position, name: me.name } : null;
+
+  useEffect(()=>{
+    if(mode==='student' && authedStudent && data && !me){
+      alert('계정 정보를 찾을 수 없어 로그아웃됩니다.');
+      handleLogout();
+    }
+    // eslint-disable-next-line
+  },[me, mode, authedStudent, data]);
+
+  useEffect(()=>{
+    if(mode==='student' && tab==='approveCheck' && !isOfficer){
+      setTab('selfCheck');
+    }
+  },[isOfficer, tab, mode]);
+
+  const pendingTodayCount = useMemo(()=>{
+    if(!data) return 0;
+    const reqs = data.roleRequests?.[todayStr()] || {};
+    return Object.values(reqs).filter(v=>v.status==='pending').length;
+  },[data]);
+
+  const pendingCouponCount = useMemo(()=>{
+    if(!data) return 0;
+    return (data.ownedCoupons||[]).filter(oc=>oc.status==='pending').length;
+  },[data]);
+
+  const handleLogin = ({mode:m, authedStudent:s})=>{
+    setMode(m);
+    setAuthedStudent(s||null);
+    if(m==='student'){
+      const initialIsOfficer = !!(s && s.position && POS[s.position]);
+      setTab(initialIsOfficer ? 'approveCheck' : 'selfCheck');
+    } else if(m==='teacher'){
+      setTab('approveCheck');
+    }
+    setDate(todayStr());
+  };
+  const handleLogout = ()=>{
+    setMode(null);
+    setAuthedStudent(null);
+    setTab('selfCheck');
+    setPinOpen(false);
+  };
+
+  const handleOpenPinChange = ()=>{
+    // ⭐ 방어: 학생 모드인데 me가 없으면 모달 열기 차단
+    if(mode==='student' && !me){
+      alert('로그인 정보를 확인할 수 없어요. 다시 로그인해주세요.');
+      return;
+    }
+    setPinOpen(true);
+  };
+
+  if(data===null){
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="text-center">
+          <div className="text-5xl mb-3 animate-pulse">☁</div>
+          <div className="text-lg font-semibold text-gray-700">데이터를 불러오는 중…</div>
+        </div>
+      </div>
+    );
+  }
+
+  if(mode===null){
+    return <AppGateway data={data} onLogin={handleLogin}/>;
+  }
+
+  if(mode==='student' && !me){
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="text-center">
+          <div className="text-4xl mb-2">⏳</div>
+          <div className="text-sm text-gray-500">계정 정보를 동기화하는 중…</div>
+        </div>
+      </div>
+    );
+  }
+
+  const tabs = [];
+  if(mode==='student'){
+    tabs.push({k:'selfCheck', l:'🙋 내 역할 인증'});
+    if(isOfficer){
+      tabs.push({k:'approveCheck', l:`🔔 역할 수행 승인${pendingTodayCount>0?` [${pendingTodayCount}]`:''}`});
+    }
+    tabs.push(
+      {k:'check',   l:'✅ 일일 체크'},
+      {k:'stats',   l:'📊 통계'},
+      {k:'cal',     l:'📆 캘린더'},
+      {k:'seat',    l:'🪑 학생 자리'},
+      {k:'roles',   l:'📌 역할'},
+      {k:'coupon',  l:'🎁 쿠폰'},
+      {k:'history', l:'📝 이력'},
+    );
+  } else {
+    tabs.push(
+      {k:'approveCheck', l:`🔔 역할 수행 승인${pendingTodayCount>0?` [${pendingTodayCount}]`:''}`},
+      {k:'check',   l:'✅ 일일 체크'},
+      {k:'stats',   l:'📊 통계'},
+      {k:'cal',     l:'📆 캘린더'},
+      {k:'seat',    l:'🪑 학생 자리'},
+      {k:'roles',   l:'📌 역할'},
+      {k:'coupon',  l:`🎁 쿠폰${pendingCouponCount>0 ? ` [${pendingCouponCount}]`:''}`},
+      {k:'history', l:'📝 이력'},
+      {k:'students', l:'👨‍👩‍👧 학생관리'},
+      {k:'tools',    l:'⚙ 도구'},
+    );
+  }
+
+  return (
+    <div className="min-h-screen">
+      <Header mode={mode} authedStudent={me} syncStatus={syncStatus}
+        onLogout={handleLogout} onOpenPinChange={handleOpenPinChange} />
+      <PinChangeModal open={pinOpen} onClose={()=>setPinOpen(false)}
+        mode={mode} me={me} data={data} setData={setData} />
+      <main className="max-w-6xl mx-auto px-3 sm:px-4 py-4">
+        {mode==='student' && (
+          <div className="bg-emerald-100 border-l-4 border-emerald-500 p-3 rounded-lg mb-3 text-sm space-y-1">
+            <div>🧒 <b>학생 모드</b>입니다. 🙋 내 역할 인증에서 오늘 수행을 신청하고, 🎁 쿠폰 탭에서 포인트로 쿠폰을 구매할 수 있어요.</div>
+            {isOfficer && (
+              <div>
+                🧑‍💼 {POS[me.position].emoji} {POS[me.position].ko} 권한으로 🔔 역할 수행 승인과 📌 역할 명칭 변경을 사용할 수 있어요.
+              </div>
+            )}
+          </div>
+        )}
+        {mode==='teacher' && (
+          <div className="bg-violet-100 border-l-4 border-violet-500 p-3 rounded-lg mb-3 text-sm">
+            👨‍🏫 <b>선생님 모드</b>입니다. 승인/반려 + 전 날짜 직접 체크/해제 + 포인트·쿠폰 관리가 가능합니다.
+          </div>
+        )}
+        <div className="flex gap-1 overflow-x-auto scrollbar-soft mb-3 hide-print">
+          {tabs.map(t=>(
+            <button key={t.k} onClick={()=>setTab(t.k)}
+              className={`px-3 py-2 rounded-lg whitespace-nowrap font-semibold text-sm
+                ${tab===t.k?'bg-white shadow border-2 border-blue-400':'bg-white/60 hover:bg-white border-2 border-transparent'}`}>
+              {t.l}
+            </button>
+          ))}
+        </div>
+
+        {tab==='selfCheck' && mode==='student' && me && (
+          <SelfCheckTab data={data} setData={setData} authedStudent={me} />
+        )}
+        {tab==='approveCheck' && (
+          (mode==='teacher' || (mode==='student' && isOfficer)) && (
+            <ApproveCheckTab data={data} setData={setData} mode={mode}
+              officer={mode==='student' ? officerInfo : null} />
+          )
+        )}
+        {tab==='check' && (
+          <div className="space-y-3">
+            {mode==='teacher' && (
+              <div className="bg-white rounded-2xl shadow p-3 flex items-center gap-2 flex-wrap">
+                <span className="font-semibold">🗓 체크할 날짜:</span>
+                <DatePicker date={date} setDate={setDate}/>
+                <button className="px-2 py-1 text-xs bg-gray-100 rounded" onClick={()=>setDate(todayStr())}>오늘</button>
+              </div>
+            )}
+            <CheckList data={data} setData={setData} mode={mode}
+              date={mode==='teacher'?date:todayStr()} />
+          </div>
+        )}
+        {tab==='stats'   && <StatsView data={data} setData={setData} mode={mode} />}
+        {tab==='cal'     && <CalendarView data={data} />}
+        {tab==='seat'    && <SeatLayoutManager data={data} setData={setData} mode={mode} />}
+        {tab==='roles'   && (
+          (mode==='student' && !isOfficer)
+            ? <ReadOnlyRoles data={data} />
+            : <RoleManager data={data} setData={setData} mode={mode}
+                officer={mode==='student' ? officerInfo : null} />
+        )}
+        {tab==='coupon'  && <CouponTab data={data} setData={setData} mode={mode} authedStudent={me} />}
+        {tab==='history' && <HistoryView data={data} />}
+        {tab==='students'&& mode==='teacher' && <StudentManager data={data} setData={setData} />}
+        {tab==='tools'   && mode==='teacher' && <TeacherTools data={data} setData={setData} />}
+      </main>
+      <footer className="text-center text-xs text-gray-400 py-4 hide-print">
+        ☁ Firestore 실시간 동기화 · 🔐 학생 단일 로그인 · 🧑‍💼 임원 권한 자동 부여 · 💰 포인트 / 🎁 쿠폰 통합 운영 · 🔑 PIN 셀프 변경
+      </footer>
+    </div>
+  );
+}
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
